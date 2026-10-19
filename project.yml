@@ -1,0 +1,43 @@
+# Generate the Xcode project with: xcodegen generate
+name: Rounds
+options:
+  bundleIdPrefix: io.soundfront
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+packages:
+  MIDIKit:
+    url: https://github.com/orchetect/MIDIKit
+    from: 0.9.0
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CLANG_CXX_LANGUAGE_STANDARD: c++17
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+targets:
+  Rounds:
+    type: application
+    platform: macOS
+    sources:
+      - App/Rounds
+      - path: Core/src
+      - path: Core/include
+      - path: Core/platform
+    dependencies:
+      - package: MIDIKit
+        product: MIDIKitIO
+      - sdk: AudioToolbox.framework
+      - sdk: CoreAudio.framework
+    info:
+      path: App/Rounds/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.soundfront.rounds
+        PRODUCT_NAME: Rounds
+        SWIFT_OBJC_BRIDGING_HEADER: App/Rounds/Rounds-Bridging-Header.h
+        HEADER_SEARCH_PATHS: $(SRCROOT)/Core/include $(SRCROOT)/Core/src
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        ENABLE_HARDENED_RUNTIME: NO
+        GENERATE_INFOPLIST_FILE: NO
+    scheme: {}
