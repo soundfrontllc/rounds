@@ -21,7 +21,8 @@ extern "C" {
 typedef struct RoundsEngine RoundsEngine;
 
 // Loop slots. All loops run on one sample clock. The first loop recorded sets
-// the base length; later loops snap to 1/8x ... 8x of it so they stay in step.
+// the tempo (its length is taken as 1, 2, 4 or 8 bars of 4/4, whichever is
+// 80-160 BPM); later loops snap to 1, 2, 4, 8 ... bars so they stay in step.
 #define ROUNDS_MAX_LOOPS 8
 
 typedef enum {
@@ -44,6 +45,9 @@ typedef enum {
     ROUNDS_CMD_UNDO_REVERTING_TAP = 4,
     // Footswitch hold: revert what the press's tap did, then stop.
     ROUNDS_CMD_STOP_REVERTING_TAP = 5,
+    // Play button (send to loop -1): stop every loop, or start every stopped
+    // loop together from the top of the longest.
+    ROUNDS_CMD_START_STOP_ALL = 6,
 } RoundsCommand;
 
 typedef enum {
@@ -52,7 +56,18 @@ typedef enum {
     ROUNDS_EVENT_LAYER_COUNT = 2,     // value = closed layers (not counting the base)
     ROUNDS_EVENT_CALIBRATION_DONE = 3,// value = measured round trip in samples (-1 = failed)
     ROUNDS_EVENT_QUEUE_FULL = 4,      // a command was dropped
+    ROUNDS_EVENT_QUEUED = 5,          // value = RoundsQueued: waiting for the next bar
 } RoundsEventType;
+
+// With quantize on and something playing, record, play and stop wait for the
+// next bar (a tap up to 1/8 bar late, at most 250 ms, counts for the bar just
+// gone: a recording then starts from that bar line). Overdub in/out and undo
+// act at once. A second tap, undo or stop takes a queued action back.
+typedef enum {
+    ROUNDS_QUEUED_NONE = 0,
+    ROUNDS_QUEUED_TAP = 1,    // record (empty loop) or play (stopped loop)
+    ROUNDS_QUEUED_STOP = 2,
+} RoundsQueued;
 
 typedef struct {
     int32_t type;          // RoundsEventType
@@ -70,11 +85,17 @@ typedef struct {
     int32_t layerOpen;      // 1 while an overdub layer is being written
     float peak;             // loop's output since last status read, linear
     float gain;
+    int32_t queued;         // RoundsQueued
 } RoundsLoopStatus;
 
 typedef struct {
     int64_t baseLength;     // samples; 0 until the first loop is recorded
     int32_t baseLoop;       // slot that set the base length, -1 if none
+    int32_t bars;           // bars in the base loop (4/4), 0 = no tempo yet
+    int64_t barLength;      // samples; tempo = 240 * sampleRate / barLength BPM
+    int64_t cycleLength;    // longest loop, samples
+    int64_t cyclePosition;  // what is heard now, from the bar grid's start, 0..cycleLength
+    int32_t running;        // 1 while any loop plays, overdubs or records
     float inputPeak;        // since last status read, linear 0..1+
     float outputPeak;
     int32_t inputLatency;   // samples, as used for compensation
@@ -112,6 +133,13 @@ void rounds_engine_set_latency(RoundsEngine* engine, int32_t inputLatency, int32
 // Gain for passing the input straight to the output (0 = off).
 void rounds_engine_set_monitor_gain(RoundsEngine* engine, float gain);
 void rounds_engine_set_loop_gain(RoundsEngine* engine, int32_t loop, float gain);
+// Quantize record/play/stop to the next bar (off by default in the engine).
+void rounds_engine_set_quantize(RoundsEngine* engine, int32_t on);
+// Click on every beat while anything plays (0 = off, the default).
+void rounds_engine_set_click_gain(RoundsEngine* engine, float gain);
+// Takes the base loop as `bars` bars (1, 2, 4 or 8), e.g. to halve or double
+// the tempo. Ignored without a tempo. The audio isn't changed.
+void rounds_engine_set_bars(RoundsEngine* engine, int32_t bars);
 
 // Play clicks and measure how long they take to come back in. Needs the
 // output physically looped back to the input (a cable), or a mic near the speaker.

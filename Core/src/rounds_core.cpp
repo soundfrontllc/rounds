@@ -48,6 +48,12 @@ void rounds_engine_set_loop_gain(RoundsEngine* engine, int32_t loop, float gain)
     engine->engine.setLoopGain(loop, gain);
 }
 
+void rounds_engine_set_quantize(RoundsEngine* engine, int32_t on) { engine->engine.setQuantize(on != 0); }
+
+void rounds_engine_set_click_gain(RoundsEngine* engine, float gain) { engine->engine.setClickGain(gain); }
+
+void rounds_engine_set_bars(RoundsEngine* engine, int32_t bars) { engine->engine.setBars(bars); }
+
 void rounds_engine_start_calibration(RoundsEngine* engine) { engine->engine.startCalibration(); }
 
 void rounds_engine_get_status(RoundsEngine* engine, RoundsStatus* out) { engine->engine.getStatus(out); }

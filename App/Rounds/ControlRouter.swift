@@ -64,6 +64,16 @@ final class ControlRouter: @unchecked Sendable {
         }
     }
 
+    /// The Launchkey's Play button (or the window's): stop every loop on the
+    /// next bar, or start every stopped loop together.
+    func startStopAll(hostTime: UInt64) {
+        let stamp = hostTime == 0 ? rounds_host_time_now() : hostTime
+        queue.async {
+            guard let engine = self.engine else { return }
+            rounds_engine_send_at_host_time(engine, -1, ROUNDS_CMD_START_STOP_ALL, stamp)
+        }
+    }
+
     /// A button in the UI. Sent "now", not scheduled.
     func send(_ command: RoundsCommand) {
         queue.async {
