@@ -1,11 +1,17 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
+#include "midi_notes.h"
+#include "rounds_core.h"
+
 namespace rounds {
 
-// One audio loop with an undoable stack of overdub layers.
+// One loop with an undoable stack of overdub layers. A loop records audio
+// until a note arrives while it records; it is then a MIDI loop, keeping
+// notes instead (tagged with their layer, so undo works the same way).
 //
 // Timing model (everything is in samples on one clock):
 //   - The looper's clock `c` advances one per processed sample.
@@ -21,6 +27,7 @@ namespace rounds {
 class Looper {
 public:
     enum class State { Empty, Recording, Overdubbing, Playing, Stopped };
+    enum class Kind { Audio, Midi };
 
     struct Config {
         int64_t maxLoopSamples = 48000 * 60;
@@ -29,6 +36,8 @@ public:
         int flattenSamplesPerBlock = 16384;
         int64_t minLoopSamples = 4800;
         int historySamples = 24000;    // recent input kept so a recording can start slightly in the past
+        int maxNotes = 4096;
+        int64_t notePreroll = 4410;    // a note this early for a recording or overdub still counts
     };
 
     explicit Looper(const Config& config);
@@ -70,6 +79,17 @@ public:
     bool layerOpen() const { return openLayer_ >= 0; }
     int64_t clock() const { return clock_; }
     int64_t maxLoopSamples() const { return config_.maxLoopSamples; }
+    Kind kind() const { return kind_; }
+    int noteCount() const { return noteCount_; }
+    int maxNotes() const { return config_.maxNotes; }
+
+    // A key pressed or released at real time `s`. Recorded while recording or
+    // overdubbing (a recording becomes MIDI on its first note); notes pressed
+    // just before a recording or overdub starts are picked up when it does.
+    void notePressed(int note, int velocity, int64_t s);
+    void noteReleased(int note, int64_t s);
+    // The loop's notes heard in the next `frames` samples, sorted by offset.
+    int collectNotes(int frames, NoteEvent* out, int capacity) const;
 
     // Session save/load, a slice at a time from the audio thread.
     // sampleAt() is what the loop plays at `index` (base plus every layer).
@@ -79,6 +99,9 @@ public:
     // Ends a load: the loop has `length` samples, is stopped, and index 0 is
     // heard at real time `origin`.
     void finishLoad(int64_t length, int64_t origin);
+    // MIDI: saved note k starts at loop index (start + rotation) % length.
+    int exportNotes(RoundsNote* dest, int capacity, int64_t rotation) const;
+    void loadNotes(const RoundsNote* notes, int count, int64_t length, int64_t origin);
 
 private:
     enum class TapEffect { None, StartedRecording, FinishedRecording, OpenedLayer, ClosedLayer, Restarted };
@@ -93,6 +116,29 @@ private:
         bool writing = true;      // false once the punch-out tail is done
     };
 
+    // index: loop index (from the recording's start while recording);
+    // length -1 while the key is held; layer -1 = base.
+    struct Note {
+        int64_t index;
+        int64_t length;
+        int64_t pressS;
+        int note;
+        int velocity;
+        int layer;
+    };
+    // A key pressed while nothing was recording, kept briefly in case a
+    // recording or overdub starts right after it.
+    struct Recent {
+        int64_t pressS = 0;
+        int64_t releaseS = -1;
+        int note = 0;
+        int velocity = 0;
+        bool used = true;
+    };
+
+    void addNote(int64_t pressS, int64_t releaseS, int note, int velocity, int layer);
+    void removeNotes(int layer);
+    void replayRecent(int64_t from, int layer);
     void startRecording(int64_t from);
     bool finishRecording();    // false if the loop would be too short
     int64_t snapLength(int64_t recorded, int64_t minimum) const;
@@ -133,6 +179,12 @@ private:
 
     int flattenSlot_ = -1;    // oldest layer being merged into the base
     int64_t flattenPos_ = 0;
+
+    Kind kind_ = Kind::Audio;
+    std::vector<Note> notes_;
+    int noteCount_ = 0;
+    std::array<Recent, 16> recent_{};
+    int recentNext_ = 0;
 };
 
 }  // namespace rounds

@@ -12,6 +12,7 @@ Looper::Config looperConfig(double sampleRate, double maxLoopSeconds) {
     config.maxLoopSamples = static_cast<int64_t>(sampleRate * maxLoopSeconds);
     config.crossfadeSamples = std::max(32, static_cast<int>(sampleRate * 0.005));  // 5 ms
     config.minLoopSamples = static_cast<int64_t>(sampleRate * 0.1);
+    config.notePreroll = static_cast<int64_t>(sampleRate * 0.1);
     return config;
 }
 
@@ -39,11 +40,14 @@ int Engine::chooseBars(int64_t baseLength, double sampleRate) {
 }
 
 Engine::Engine(double sampleRate, double maxLoopSeconds, int maxBlockFrames)
-    : sampleRate_(sampleRate), maxBlock_(maxBlockFrames), probe_(sampleRate) {
+    : sampleRate_(sampleRate), maxBlock_(maxBlockFrames), kits_(sampleRate), probe_(sampleRate) {
     for (int i = 0; i < kLoops; i++) {
         loops_.push_back(std::make_unique<Looper>(looperConfig(sampleRate, maxLoopSeconds)));
         loopGain_[static_cast<size_t>(i)].store(1.0f);
     }
+    for (int i = 0; i < kLoops + 2; i++) players_.push_back(std::make_unique<Player>(sampleRate, &kits_));
+    players_[kPadsPlayer]->setInstrument(ROUNDS_INSTRUMENT_DRY_KIT);
+    transferNotes_.resize(static_cast<size_t>(loops_[0]->maxNotes()));
     zeros_.assign(static_cast<size_t>(maxBlockFrames), 0.0f);
     scratch_.assign(static_cast<size_t>(maxBlockFrames), 0.0f);
     transferBuffer_.assign(static_cast<size_t>(loops_[0]->maxLoopSamples()), 0.0f);
@@ -52,14 +56,48 @@ Engine::Engine(double sampleRate, double maxLoopSeconds, int maxBlockFrames)
 // ---------------------------------------------------------------------------
 // Non-real-time side
 
+bool Engine::push(const Command& command) {
+    std::lock_guard<std::mutex> lock(producerMutex_);
+    return commands_.push(command);
+}
+
 bool Engine::send(int loop, RoundsCommand cmd, int64_t sampleTime) {
     if (!validLoop(loop) && !(cmd == ROUNDS_CMD_START_STOP_ALL && loop == -1)) return false;
-    std::lock_guard<std::mutex> lock(producerMutex_);
-    return commands_.push(Command{loop, cmd, sampleTime});
+    return push(Command{loop, cmd, sampleTime});
 }
 
 bool Engine::sendAtHostTime(int loop, RoundsCommand cmd, uint64_t hostTime) {
-    if (hostTime == 0) return send(loop, cmd, -1);
+    const int64_t at = hostToSample(hostTime);
+    // One block of fixed delay: the moment has usually already been rendered,
+    // and a constant delay feels tighter than a jittery one.
+    return send(loop, cmd, at < 0 ? -1 : at + statBlock_.load(std::memory_order_relaxed));
+}
+
+bool Engine::note(int loop, int instrument, int note, int velocity, uint64_t hostTime) {
+    if (loop < -1 || loop >= kLoops || instrument < 0 || instrument >= ROUNDS_INSTRUMENT_COUNT) return false;
+    if (note < 0 || note > 127) return false;
+    Command command{loop, kCmdNote, -1};
+    const int64_t at = hostToSample(hostTime);
+    if (at >= 0) {
+        command.time = at + statBlock_.load(std::memory_order_relaxed);
+        command.when = at;
+    }
+    command.note = static_cast<int16_t>(note);
+    command.velocity = static_cast<int16_t>(std::clamp(velocity, 0, 127));
+    command.instrument = static_cast<int16_t>(instrument);
+    return push(command);
+}
+
+bool Engine::setInstrument(int loop, int instrument) {
+    if (!validLoop(loop) || instrument < 0 || instrument >= ROUNDS_INSTRUMENT_COUNT) return false;
+    Command command{loop, kCmdInstrument, -1};
+    command.instrument = static_cast<int16_t>(instrument);
+    return push(command);
+}
+
+// Engine sample time of a host time, or -1 before the audio has run.
+int64_t Engine::hostToSample(uint64_t hostTime) {
+    if (hostTime == 0) return -1;
     uint64_t mapHost;
     int64_t mapSample;
     double ticksPerSample;
@@ -72,12 +110,9 @@ bool Engine::sendAtHostTime(int loop, RoundsCommand cmd, uint64_t hostTime) {
         std::atomic_thread_fence(std::memory_order_acquire);
     } while ((seq & 1u) || seq != mapSeq_.load(std::memory_order_relaxed));
 
-    if (ticksPerSample <= 0.0) return send(loop, cmd, -1);
+    if (ticksPerSample <= 0.0) return -1;
     const double deltaTicks = static_cast<double>(hostTime) - static_cast<double>(mapHost);
-    const int64_t sampleAt = mapSample + static_cast<int64_t>(std::llround(deltaTicks / ticksPerSample));
-    // One block of fixed delay: the moment has usually already been rendered,
-    // and a constant delay feels tighter than a jittery one.
-    return send(loop, cmd, sampleAt + statBlock_.load(std::memory_order_relaxed));
+    return mapSample + static_cast<int64_t>(std::llround(deltaTicks / ticksPerSample));
 }
 
 void Engine::setLatency(int inputLatency, int outputLatency) {
@@ -119,6 +154,9 @@ void Engine::getLoopStatus(int loop, RoundsLoopStatus* out) {
     out->peak = s.peak.exchange(0.0f);
     out->gain = loopGain_[static_cast<size_t>(loop)].load();
     out->queued = s.queued.load();
+    out->kind = s.kind.load();
+    out->instrument = s.instrument.load();
+    out->notes = s.notes.load();
 }
 
 // ---------------------------------------------------------------------------
@@ -137,8 +175,37 @@ bool Engine::beginImport(int loop, const float* samples, int64_t length) {
     std::memcpy(transferBuffer_.data(), samples, sizeof(float) * static_cast<size_t>(length));
     transferLoop_ = loop;
     transferLength_ = length;
+    transferMidi_ = false;
     transfer_.store(kImportRequested, std::memory_order_release);
     return true;
+}
+
+bool Engine::beginImportNotes(int loop, const RoundsNote* notes, int count, int64_t length, int instrument) {
+    if (!validLoop(loop) || length <= 1 || length > maxLoopSamples() || count < 0 || count > maxNotes()) return false;
+    if (instrument < 0 || instrument >= ROUNDS_INSTRUMENT_COUNT) return false;
+    if (transfer_.load(std::memory_order_acquire) != kIdle) return false;
+    std::copy(notes, notes + count, transferNotes_.begin());
+    transferNoteCount_ = count;
+    transferLoop_ = loop;
+    transferLength_ = length;
+    transferInstrument_ = instrument;
+    transferMidi_ = true;
+    transfer_.store(kImportRequested, std::memory_order_release);
+    return true;
+}
+
+int Engine::takeExportNotes(RoundsNote* dest, int capacity, int64_t* length, int* instrument) {
+    if (transfer_.load(std::memory_order_acquire) != kExportDone) return -1;
+    const int count = transferNoteCount_;
+    if (!transferMidi_ || count > capacity) {
+        transfer_.store(kIdle, std::memory_order_release);
+        return -1;
+    }
+    std::copy(transferNotes_.begin(), transferNotes_.begin() + count, dest);
+    *length = transferLength_;
+    *instrument = transferInstrument_;
+    transfer_.store(kIdle, std::memory_order_release);
+    return count;
 }
 
 // 0 = idle, 1 = in progress, 2 = done, -1 = failed. A finished import or a
@@ -156,7 +223,10 @@ int Engine::transferStatus() {
 int64_t Engine::takeExport(float* dest, int64_t capacity) {
     if (transfer_.load(std::memory_order_acquire) != kExportDone) return -1;
     const int64_t length = transferLength_;
-    if (length > capacity) return -1;
+    if (transferMidi_ || length > capacity) {
+        transfer_.store(kIdle, std::memory_order_release);
+        return -1;
+    }
     std::memcpy(dest, transferBuffer_.data(), sizeof(float) * static_cast<size_t>(length));
     transfer_.store(kIdle, std::memory_order_release);
     return length;
@@ -205,8 +275,14 @@ bool Engine::cancelScheduled(int loop) {
     return true;
 }
 
-void Engine::apply(int loop, int32_t cmd) {
-    if (cmd == ROUNDS_CMD_START_STOP_ALL) {
+void Engine::apply(const Command& command) {
+    const int loop = command.loop;
+    const int32_t cmd = command.cmd;
+    if (cmd == kCmdNote) {
+        applyNote(command);
+    } else if (cmd == kCmdInstrument) {
+        players_[static_cast<size_t>(loop)]->setInstrument(command.instrument);
+    } else if (cmd == ROUNDS_CMD_START_STOP_ALL) {
         startStopAll();
     } else {
         if (importing(loop)) return;  // the loop is being loaded from a session
@@ -245,7 +321,57 @@ void Engine::apply(int loop, int32_t cmd) {
         }
     }
     updateBase();
+    releaseStaleNotes();
     publish();
+}
+
+void Engine::applyNote(const Command& command) {
+    const int note = command.note;
+    const int velocity = command.velocity;
+    const int64_t when = command.when;
+    Player& preview = *players_[isDrumKit(command.instrument) ? kPadsPlayer : kKeysPlayer];
+    const bool slot = validLoop(command.loop) && !importing(command.loop);
+    if (velocity == 0) {
+        // Released wherever it may have been played: the loop can have
+        // changed kind since the key went down.
+        preview.noteOff(note, false);
+        if (slot) {
+            players_[static_cast<size_t>(command.loop)]->noteOff(note, false);
+            loops_[static_cast<size_t>(command.loop)]->noteReleased(note, when);
+        }
+        return;
+    }
+    if (slot) {
+        Looper& looper = *loops_[static_cast<size_t>(command.loop)];
+        Player& player = *players_[static_cast<size_t>(command.loop)];
+        const Looper::State state = looper.state();
+        const bool midi = looper.kind() == Looper::Kind::Midi && state != Looper::State::Empty;
+        const bool canBecomeMidi = state == Looper::State::Empty || (state == Looper::State::Recording && !midi);
+        if (midi || canBecomeMidi) {
+            if (!midi) player.setInstrument(command.instrument);
+            player.noteOn(note, velocity, false);
+            looper.notePressed(note, velocity, when);
+            return;
+        }
+    }
+    // An audio loop, or no loop: just play it.
+    preview.setInstrument(command.instrument);
+    preview.noteOn(note, velocity, false);
+}
+
+// A MIDI loop that stops or loses notes (undo, clear) lets go of what it was playing.
+void Engine::releaseStaleNotes() {
+    for (int i = 0; i < kLoops; i++) {
+        const Looper& looper = *loops_[static_cast<size_t>(i)];
+        const bool audible = looper.kind() == Looper::Kind::Midi &&
+                             (looper.state() == Looper::State::Playing || looper.state() == Looper::State::Overdubbing);
+        const int notes = looper.noteCount();
+        if ((midiAudible_[static_cast<size_t>(i)] && !audible) || notes < midiNotes_[static_cast<size_t>(i)]) {
+            players_[static_cast<size_t>(i)]->releaseLoopNotes();
+        }
+        midiAudible_[static_cast<size_t>(i)] = audible;
+        midiNotes_[static_cast<size_t>(i)] = notes;
+    }
 }
 
 void Engine::tap(int loop) {
@@ -342,6 +468,7 @@ void Engine::fireScheduled(int loop) {
     if (s.action == kQueuedStop) looper.stop();
     s.action = kNone;
     updateBase();
+    releaseStaleNotes();
     publish();
 }
 
@@ -420,8 +547,25 @@ void Engine::stepTransfer() {
         // base loop's top, so every saved loop lines up with the others.
         const int64_t ref = baseLoop_ >= 0 ? loops_[static_cast<size_t>(baseLoop_)]->origin() : looper.origin();
         transferRotation_ = ((ref - looper.origin()) % transferLength_ + transferLength_) % transferLength_;
+        transferMidi_ = looper.kind() == Looper::Kind::Midi;
+        if (transferMidi_) {
+            // Notes are few: copy them all at once.
+            transferNoteCount_ = looper.exportNotes(transferNotes_.data(), static_cast<int>(transferNotes_.size()), transferRotation_);
+            transferInstrument_ = players_[static_cast<size_t>(transferLoop_)]->instrument();
+            transfer_.store(kExportDone, std::memory_order_release);
+            return;
+        }
         transfer_.store(kExporting, std::memory_order_relaxed);
     } else if (state == kImportRequested) {
+        if (transferMidi_) {
+            looper.loadNotes(transferNotes_.data(), transferNoteCount_, transferLength_, 0);
+            players_[static_cast<size_t>(transferLoop_)]->setInstrument(transferInstrument_);
+            updateBase();
+            releaseStaleNotes();
+            publish();
+            transfer_.store(kImportDone, std::memory_order_release);
+            return;
+        }
         transferPos_ = 0;
         transfer_.store(kImporting, std::memory_order_relaxed);
     }
@@ -506,8 +650,11 @@ void Engine::processChunk(const float* input, float* out, int frames, int64_t st
     }
     for (int l = 0; l < kLoops; l++) {
         std::memset(scratch_.data(), 0, sizeof(float) * static_cast<size_t>(frames));
-        loops_[static_cast<size_t>(l)]->process(input, scratch_.data(), frames,
-                                                 loopGain_[static_cast<size_t>(l)].load(std::memory_order_relaxed));
+        Looper& looper = *loops_[static_cast<size_t>(l)];
+        const float gain = loopGain_[static_cast<size_t>(l)].load(std::memory_order_relaxed);
+        const int events = looper.collectNotes(frames, noteEvents_.data(), static_cast<int>(noteEvents_.size()));
+        looper.process(input, scratch_.data(), frames, gain);
+        players_[static_cast<size_t>(l)]->render(scratch_.data(), frames, gain, noteEvents_.data(), events);
         float peak = chunkPeak_[static_cast<size_t>(l)];
         for (int i = 0; i < frames; i++) {
             out[i] += scratch_[static_cast<size_t>(i)];
@@ -515,6 +662,8 @@ void Engine::processChunk(const float* input, float* out, int frames, int64_t st
         }
         chunkPeak_[static_cast<size_t>(l)] = peak;
     }
+    players_[kKeysPlayer]->render(out, frames, 1.0f, nullptr, 0);
+    players_[kPadsPlayer]->render(out, frames, 1.0f, nullptr, 0);
     renderClick(out, frames, start);
     const float monitor = monitorGain_.load(std::memory_order_relaxed);
     if (monitor > 0.0f) {
@@ -555,6 +704,7 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
     Command incoming;
     while (pendingCount_ < 64 && commands_.pop(incoming)) {
         if (incoming.time < 0) incoming.time = now_;
+        if (incoming.when < 0) incoming.when = incoming.time;
         int i = pendingCount_++;
         while (i > 0 && pending_[i - 1].time > incoming.time) {
             pending_[i] = pending_[i - 1];
@@ -574,7 +724,7 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
             const Command command = pending_[0];
             for (int i = 1; i < pendingCount_; i++) pending_[i - 1] = pending_[i];
             pendingCount_--;
-            apply(command.loop, command.cmd);
+            apply(command);
         }
         for (int l = 0; l < kLoops; l++) {
             if (scheduled_[static_cast<size_t>(l)].action != kNone && scheduled_[static_cast<size_t>(l)].time <= at) {
@@ -601,6 +751,7 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
     now_ += frames;
     stepTransfer();
     updateBase();  // a loop can close itself when it runs out of room
+    releaseStaleNotes();
     publish();
     storeMax(statInputPeak_, inPeak);
     storeMax(statOutputPeak_, outPeak);
@@ -615,6 +766,9 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
         s.layers.store(looper.closedLayers(), std::memory_order_relaxed);
         s.layerOpen.store(looper.layerOpen() ? 1 : 0, std::memory_order_relaxed);
         s.queued.store(scheduled_[static_cast<size_t>(l)].action, std::memory_order_relaxed);
+        s.kind.store(looper.kind() == Looper::Kind::Midi ? ROUNDS_KIND_MIDI : ROUNDS_KIND_AUDIO, std::memory_order_relaxed);
+        s.instrument.store(players_[static_cast<size_t>(l)]->instrument(), std::memory_order_relaxed);
+        s.notes.store(looper.noteCount(), std::memory_order_relaxed);
     }
     int64_t cycle = 0;
     for (const auto& looper : loops_) cycle = std::max(cycle, looper->loopLength());

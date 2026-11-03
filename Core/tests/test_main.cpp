@@ -872,6 +872,252 @@ static void testStartStopAll() {
           (long long)g.s(1).playPosition, (long long)g.inBar());
 }
 
+// ---------------------------------------------------------------------------
+// MIDI loops and instruments (milestone 4)
+
+// Runs the engine with a host clock that counts samples, so notes and taps
+// can be stamped with exact times. Keeps the engine's output.
+struct Keys {
+    Engine engine{kRate, 10.0, 128};
+    int64_t now = 0;
+    std::vector<float> out;
+    Keys(int in = 0, int outLat = 0) { engine.setLatency(in, outLat); }
+    void run(int64_t samples) {
+        std::vector<float> in(128, 0.0f), l(128), r(128);
+        for (int64_t done = 0; done < samples; done += 128) {
+            engine.processTimed(in.data(), l.data(), r.data(), 128, static_cast<uint64_t>(now) + 1, 1.0);
+            out.insert(out.end(), l.begin(), l.end());
+            now += 128;
+        }
+    }
+    // Runs up to sample `t` (a block boundary at or before it).
+    void runTo(int64_t t) {
+        if (t > now) run(((t - now) / 128) * 128);
+    }
+    // Pressed at sample t (applied one block later, like the hardware).
+    void note(int loop, int instrument, int n, int velocity, int64_t t) {
+        runTo(t);
+        engine.note(loop, instrument, n, velocity, static_cast<uint64_t>(t) + 1);
+    }
+    // A footswitch tap pressed at t lands at t + 128.
+    void tap(int loop, int64_t t) {
+        runTo(t);
+        engine.sendAtHostTime(loop, ROUNDS_CMD_TAP, static_cast<uint64_t>(t) + 1);
+    }
+    void command(int loop, RoundsCommand cmd) {
+        engine.send(loop, cmd, -1);
+        run(256);
+    }
+    RoundsLoopStatus s(int loop = 0) { return loopStatus(engine, loop); }
+    // First sample at or after `from` where the output starts after silence.
+    int64_t onset(int64_t from, int64_t to) const {
+        for (int64_t t = std::max<int64_t>(from, 1); t < to && t < int64_t(out.size()); t++) {
+            if (std::fabs(out[size_t(t)]) > 1e-4f && std::fabs(out[size_t(t - 1)]) <= 1e-4f) return t;
+        }
+        return -1;
+    }
+    float peak(int64_t from, int64_t to) const {
+        float p = 0.0f;
+        for (int64_t t = std::max<int64_t>(from, 0); t < to && t < int64_t(out.size()); t++) p = std::max(p, std::fabs(out[size_t(t)]));
+        return p;
+    }
+};
+
+static void testMidiLoopTiming() {
+    std::printf("MIDI loops: pads record into a loop and play back on the sample\n");
+    const int in = 200, outLat = 300;
+    Keys k(in, outLat);
+    const int64_t start = 10000 + 128;  // the tap lands a block after it is pressed
+    k.tap(0, 10000);
+    k.note(0, ROUNDS_INSTRUMENT_DRY_KIT, 37, 110, start + 1000);  // rim
+    k.note(0, ROUNDS_INSTRUMENT_DRY_KIT, 37, 0, start + 2000);
+    k.note(0, ROUNDS_INSTRUMENT_DRY_KIT, 42, 90, start + 24000);  // closed hat
+    k.note(0, ROUNDS_INSTRUMENT_DRY_KIT, 42, 0, start + 25000);
+    k.tap(0, start + 48000 - 128);
+    k.run(256);
+    const int64_t L = k.s().loopLength;
+    CHECK(k.s().kind == ROUNDS_KIND_MIDI, "became a MIDI loop");
+    CHECK(k.s().instrument == ROUNDS_INSTRUMENT_DRY_KIT, "playing the kit it was recorded with");
+    CHECK(k.s().notes == 2, "two notes recorded (%d)", k.s().notes);
+    CHECK(L == 48000, "length %lld", (long long)L);
+    k.run(48000 * 3);
+    // A note pressed at real time t is heard at t + L: written outputLatency earlier.
+    for (int cycle = 1; cycle <= 2; cycle++) {
+        const int64_t rim = start + 1000 + cycle * L - outLat;
+        const int64_t hat = start + 24000 + cycle * L - outLat;
+        const int64_t gotRim = k.onset(rim - 2000, rim + 2000);
+        const int64_t gotHat = k.onset(hat - 2000, hat + 2000);
+        CHECK(gotRim == rim, "cycle %d: rim off by %lld samples", cycle, (long long)(gotRim - rim));
+        CHECK(gotHat == hat, "cycle %d: hat off by %lld samples", cycle, (long long)(gotHat - hat));
+    }
+}
+
+static void testMidiOverdubAndUndo() {
+    std::printf("MIDI loops: overdub a layer, undo it\n");
+    Keys k;
+    k.tap(0, 1000);
+    const int64_t start = 1128;
+    k.note(0, ROUNDS_INSTRUMENT_DRY_KIT, 37, 100, start + 500);
+    k.tap(0, start + 48000 - 128);
+    k.run(256);
+    const int64_t L = k.s().loopLength;
+    // Overdub: a hat at a quarter of the loop.
+    k.tap(0, start + L + 1000);
+    k.run(256);
+    CHECK(k.s().state == ROUNDS_LOOP_OVERDUBBING, "overdubbing");
+    k.note(0, ROUNDS_INSTRUMENT_DRY_KIT, 42, 100, start + L + 12000);
+    k.note(0, ROUNDS_INSTRUMENT_DRY_KIT, 42, 0, start + L + 13000);
+    k.tap(0, start + L + 30000);
+    k.run(256);
+    CHECK(k.s().notes == 2 && k.s().layers == 1, "one layer with one note (%d notes, %d layers)", k.s().notes, k.s().layers);
+    k.runTo(start + 3 * L);
+    const int64_t hat = start + 12000 + 3 * L;
+    k.run(L);
+    CHECK(k.onset(hat - 1000, hat + 1000) == hat, "overdubbed note plays where it was played");
+    k.command(0, ROUNDS_CMD_UNDO);
+    CHECK(k.s().notes == 1 && k.s().layers == 0, "undo removes the layer's note (%d)", k.s().notes);
+    k.runTo(start + 5 * L);
+    k.run(L);
+    const int64_t hat5 = start + 12000 + 5 * L;
+    CHECK(k.peak(hat5 - 100, hat5 + 2000) < 1e-4f, "undone note is gone");
+    const int64_t rim5 = start + 500 + 5 * L;
+    CHECK(k.onset(rim5 - 1000, rim5 + 1000) == rim5, "base note still plays");
+}
+
+static void testMidiNoteBeforeStart() {
+    std::printf("MIDI loops: a note just before the recording starts lands on its start\n");
+    Keys k;
+    k.note(0, ROUNDS_INSTRUMENT_SUB_BASS, 40, 100, 9000);  // 1128 samples before the tap lands
+    k.tap(0, 10000);
+    k.note(0, ROUNDS_INSTRUMENT_SUB_BASS, 40, 0, 20000);
+    k.tap(0, 10128 + 48000 - 128);
+    k.run(256);
+    CHECK(k.s().kind == ROUNDS_KIND_MIDI && k.s().notes == 1, "note picked up (%d)", k.s().notes);
+    CHECK(k.s().instrument == ROUNDS_INSTRUMENT_SUB_BASS, "plays the keys' instrument");
+    CHECK(k.engine.beginExport(0), "export");
+    k.run(256);
+    CHECK(k.engine.transferStatus() == 2, "export done");
+    std::vector<RoundsNote> notes(16);
+    int64_t length = 0;
+    int instrument = -1;
+    const int count = k.engine.takeExportNotes(notes.data(), 16, &length, &instrument);
+    CHECK(count == 1 && notes[0].start == 0, "on the loop's start (%d notes, start %lld)", count, (long long)notes[0].start);
+    CHECK(count == 1 && notes[0].length == 20000 - 9000, "full length kept (%lld)", (long long)notes[0].length);
+}
+
+static void testMidiSaveAndLoad() {
+    std::printf("MIDI loops: save and load\n");
+    Keys k;
+    k.tap(0, 1000);
+    const int64_t start = 1128;
+    k.note(0, ROUNDS_INSTRUMENT_DRY_KIT, 37, 100, start + 7000);
+    k.note(0, ROUNDS_INSTRUMENT_DRY_KIT, 37, 0, start + 8000);
+    k.tap(0, start + 48000 - 128);
+    k.run(256);
+    k.engine.setInstrument(0, ROUNDS_INSTRUMENT_ELECTRO_KIT);
+    k.run(256);
+    CHECK(k.s().instrument == ROUNDS_INSTRUMENT_ELECTRO_KIT, "instrument switched");
+    k.engine.beginExport(0);
+    k.run(256);
+    std::vector<RoundsNote> notes(16);
+    int64_t length = 0;
+    int instrument = -1;
+    const int count = k.engine.takeExportNotes(notes.data(), 16, &length, &instrument);
+    CHECK(count == 1 && length == 48000 && instrument == ROUNDS_INSTRUMENT_ELECTRO_KIT, "exported");
+    float samples[4] = {};
+    CHECK(k.engine.takeExport(samples, 4) == -1, "not audio");
+
+    Keys loaded;
+    loaded.run(256);
+    CHECK(loaded.engine.beginImportNotes(2, notes.data(), count, length, instrument), "import");
+    loaded.run(256);
+    CHECK(loaded.engine.transferStatus() == 2, "import done");
+    CHECK(loaded.s(2).state == ROUNDS_LOOP_STOPPED && loaded.s(2).kind == ROUNDS_KIND_MIDI && loaded.s(2).notes == 1,
+          "loaded stopped as MIDI");
+    CHECK(loaded.s(2).instrument == ROUNDS_INSTRUMENT_ELECTRO_KIT, "with its instrument");
+    CHECK(status(loaded.engine).bars > 0, "sets the tempo");
+    const int64_t tapAt = 20000;
+    loaded.tap(2, tapAt);
+    loaded.run(48000);
+    const int64_t rim = tapAt + 128 + 7000;
+    CHECK(loaded.onset(rim - 1000, rim + 1000) == rim, "plays from the top (%lld)", (long long)(loaded.onset(rim - 1000, rim + 1000) - rim));
+}
+
+static void testMidiQuantizedRecording() {
+    std::printf("MIDI loops: a queued recording picks up a note played just before its bar line\n");
+    Keys k;
+    k.engine.setQuantize(true);
+    k.tap(0, 1000);             // an (empty-sounding) audio loop sets the tempo
+    k.tap(0, 1000 + 192000);
+    k.run(256);
+    const int64_t bar = status(k.engine).barLength;
+    CHECK(bar == 96000, "bar %lld", (long long)bar);
+    // Next bar line after now, in engine time (no latency here).
+    const int64_t pos = status(k.engine).cyclePosition % bar;
+    const int64_t line = k.now + (bar - pos) + bar;  // the one after next, to leave room
+    k.tap(1, line - bar / 2);
+    k.run(256);
+    CHECK(k.s(1).queued == ROUNDS_QUEUED_TAP, "recording queued");
+    k.note(1, ROUNDS_INSTRUMENT_E_PIANO, 64, 90, line - 1500);  // a little early
+    k.note(1, ROUNDS_INSTRUMENT_E_PIANO, 64, 0, line + 6000);
+    k.note(1, ROUNDS_INSTRUMENT_E_PIANO, 67, 90, line + 30000);
+    k.note(1, ROUNDS_INSTRUMENT_E_PIANO, 67, 0, line + 40000);
+    k.runTo(line + 256);
+    k.run(256);
+    CHECK(k.s(1).state == ROUNDS_LOOP_RECORDING && k.s(1).kind == ROUNDS_KIND_MIDI, "recording MIDI from the bar line");
+    k.tap(1, line + bar - 128 + 2000);  // closed a little late: snaps to one bar
+    k.run(512);
+    CHECK(k.s(1).loopLength == bar, "one bar (%lld)", (long long)k.s(1).loopLength);
+    k.engine.beginExport(1);
+    k.run(256);
+    std::vector<RoundsNote> notes(16);
+    int64_t length = 0;
+    int instrument = -1;
+    const int count = k.engine.takeExportNotes(notes.data(), 16, &length, &instrument);
+    CHECK(count == 2, "two notes (%d)", count);
+    if (count == 2) {
+        CHECK(notes[0].start == 0 && notes[0].length == 7500, "early note on the bar line (%lld, %lld)",
+              (long long)notes[0].start, (long long)notes[0].length);
+        CHECK(notes[1].start == 30000, "second note where it was played (%lld)", (long long)notes[1].start);
+    }
+}
+
+static void testStoppedMidiLetsGo() {
+    std::printf("MIDI loops: stopping releases held loop notes\n");
+    Keys k;
+    k.tap(0, 1000);
+    k.note(0, ROUNDS_INSTRUMENT_WARM_PAD, 60, 100, 2000);
+    k.note(0, ROUNDS_INSTRUMENT_WARM_PAD, 60, 0, 40000);
+    k.tap(0, 1128 + 48000 - 128);
+    k.run(48000 + 20000);  // into the second time round: the pad sounds
+    CHECK(k.peak(k.now - 2000, k.now) > 0.01f, "pad sounds");
+    k.command(0, ROUNDS_CMD_STOP);
+    k.run(48000 * 3);
+    CHECK(k.peak(k.now - 4000, k.now) < 1e-4f, "silent after stopping");
+}
+
+static void testInstruments() {
+    std::printf("Instruments: every sound plays, stays in range and ends\n");
+    static const char* names[] = {"Sub Bass", "Finger Bass", "Synth Bass", "E-Piano", "Warm Pad", "Mono Lead", "Dry Kit", "Electro Kit"};
+    for (int i = 0; i < ROUNDS_INSTRUMENT_COUNT; i++) {
+        Keys k;
+        k.run(256);
+        const bool kit = i >= ROUNDS_INSTRUMENT_DRY_KIT;
+        const int notes[] = {36, 38, 39, 42, 46, 45, 58, 37};
+        for (int n = 0; n < (kit ? 8 : 3); n++) {
+            const int note = kit ? notes[n] : 36 + 12 * n;
+            k.note(-1, i, note, 100, k.now + 2000 + n * 12000);
+            k.note(-1, i, note, 0, k.now + 9000);
+        }
+        k.run(48000 * 4);
+        const float peak = k.peak(0, k.now);
+        bool finite = true;
+        for (float v : k.out) finite = finite && std::isfinite(v);
+        CHECK(finite && peak > 0.02f && peak < 1.2f, "%s: peak %.3f", names[i], peak);
+        CHECK(k.peak(k.now - 4800, k.now) < 1e-4f, "%s: silent after release", names[i]);
+    }
+}
+
 int main() {
     testRecordAndPlaybackAlignment();
     testOverdubAlignment();
@@ -892,6 +1138,13 @@ int main() {
     testQuantizedRecordingAudio();
     testClick();
     testStartStopAll();
+    testMidiLoopTiming();
+    testMidiOverdubAndUndo();
+    testMidiNoteBeforeStart();
+    testMidiSaveAndLoad();
+    testMidiQuantizedRecording();
+    testStoppedMidiLetsGo();
+    testInstruments();
     std::printf("\n%d checks, %d failed\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

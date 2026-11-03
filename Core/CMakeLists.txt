@@ -10,6 +10,7 @@ endif()
 add_library(rounds_core STATIC
   src/engine.cpp
   src/footswitch.cpp
+  src/instruments.cpp
   src/looper.cpp
   src/rounds_core.cpp
 )

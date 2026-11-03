@@ -3,15 +3,18 @@ import AVFoundation
 import Foundation
 
 /// A saved session is a folder: `session.json` plus one mono 32-bit float WAV
-/// per recorded loop (`loop-1.wav` …). Each loop is saved with its overdubs
-/// merged (undo history isn't kept), rotated so every file starts at the base
-/// loop's top: the loops line up when the files are laid side by side.
+/// per recorded audio loop (`loop-1.wav` …). MIDI loops keep their notes in
+/// the manifest. Each loop is saved with its overdubs merged (undo history
+/// isn't kept), rotated so every loop starts at the base loop's top: the
+/// loops line up when the files are laid side by side.
 struct SessionManifest: Codable {
     struct Loop: Codable {
         var slot: Int
         var gain: Float
-        var file: String?      // nil for an empty slot
+        var file: String?      // audio loops
         var samples: Int64?    // loop length at `sampleRate`
+        var instrument: String?   // MIDI loops: instrument name
+        var notes: [[Int64]]?     // MIDI loops: [start, length, note, velocity], samples at `sampleRate`
     }
 
     var format = 1
@@ -211,6 +214,8 @@ extension LooperModel {
         var manifest = SessionManifest(sampleRate: sampleRate, baseLoop: baseLoop, bars: bars > 0 ? bars : nil,
                                        selectedLoop: selectedLoop, loops: [])
         var audio: [Int: [Float]] = [:]
+        var midiSaved: Set<Int> = []
+        let noteCapacity = rounds_engine_max_notes(engine)
         for loop in loops {
             var entry = SessionManifest.Loop(slot: loop.id, gain: loop.gain)
             defer { manifest.loops.append(entry) }
@@ -227,6 +232,20 @@ extension LooperModel {
                 append("Session", "Loop \(loop.id + 1) couldn't be saved (re-recorded or cleared while saving)")
                 continue
             }
+            if loop.midi {
+                var notes = [RoundsNote](repeating: RoundsNote(), count: Int(noteCapacity))
+                var length: Int64 = 0
+                var instrument: Int32 = 0
+                let count = notes.withUnsafeMutableBufferPointer {
+                    rounds_engine_take_export_notes(engine, $0.baseAddress, noteCapacity, &length, &instrument)
+                }
+                guard count >= 0, length > 0 else { continue }
+                entry.samples = length
+                entry.instrument = (Instrument(rawValue: instrument) ?? .subBass).name
+                entry.notes = notes.prefix(Int(count)).map { [$0.start, $0.length, Int64($0.note), Int64($0.velocity)] }
+                midiSaved.insert(loop.id)
+                continue
+            }
             var samples = [Float](repeating: 0, count: Int(capacity))
             let length = samples.withUnsafeMutableBufferPointer { rounds_engine_take_export(engine, $0.baseAddress, capacity) }
             guard length > 0 else { continue }
@@ -235,9 +254,10 @@ extension LooperModel {
             entry.file = "loop-\(loop.id + 1).wav"
             entry.samples = length
         }
-        if manifest.baseLoop >= 0 && audio[manifest.baseLoop] == nil {
+        let saved = Set(audio.keys).union(midiSaved)
+        if manifest.baseLoop >= 0 && !saved.contains(manifest.baseLoop) {
             // The base wasn't saved: the first saved loop sets the tempo on load.
-            manifest.baseLoop = audio.keys.min() ?? -1
+            manifest.baseLoop = saved.min() ?? -1
             manifest.bars = nil
         }
 
@@ -250,7 +270,7 @@ extension LooperModel {
         }
         sessionURL = url
         sessionMessage = nil
-        append("Session", "Saved \(name): \(audio.count) loop\(audio.count == 1 ? "" : "s") to \(url.path)")
+        append("Session", "Saved \(name): \(saved.count) loop\(saved.count == 1 ? "" : "s") to \(url.path)")
     }
 
     private func open(_ url: URL) async {
@@ -264,9 +284,11 @@ extension LooperModel {
 
         let manifest: SessionManifest
         let audio: [Int: [Float]]
+        let midi: [Int: MIDILoop]
         do {
             manifest = try SessionFiles.readManifest(in: url)
             audio = try await Task.detached { try Self.loadAudio(manifest, folder: url, sampleRate: rate) }.value
+            midi = Self.loadNotes(manifest, sampleRate: rate)
         } catch {
             return sessionFailed("Couldn't open \(name): \(error.localizedDescription)")
         }
@@ -277,9 +299,23 @@ extension LooperModel {
 
         // The base loop loads first so it becomes the base again.
         for loop in 0..<Int(ROUNDS_MAX_LOOPS) { rounds_engine_send(engine, Int32(loop), ROUNDS_CMD_CLEAR, -1) }
-        let order = audio.keys.sorted { a, b in a == manifest.baseLoop || (b != manifest.baseLoop && a < b) }
+        let slots = Set(audio.keys).union(midi.keys)
+        let order = slots.sorted { a, b in a == manifest.baseLoop || (b != manifest.baseLoop && a < b) }
         var loaded = 0
         for slot in order {
+            if let loop = midi[slot] {
+                let started = loop.notes.withUnsafeBufferPointer {
+                    rounds_engine_begin_import_notes(engine, Int32(slot), $0.baseAddress, Int32(loop.notes.count),
+                                                     loop.length, loop.instrument.rawValue)
+                }
+                guard started == 1, await finishTransfer(engine) == 2 else {
+                    guard self.engine == engine else { return sessionFailed("Audio stopped while opening \(name).") }
+                    append("Session", "Loop \(slot + 1) couldn't be loaded")
+                    continue
+                }
+                loaded += 1
+                continue
+            }
             guard let samples = audio[slot] else { continue }
             guard Int64(samples.count) <= capacity else {
                 append("Session", "Loop \(slot + 1) is longer than Rounds' \(Int(maxLoopSeconds)) s limit and wasn't loaded")
@@ -334,6 +370,43 @@ extension LooperModel {
             audio[loop.slot] = converted
         }
         return audio
+    }
+
+    struct MIDILoop {
+        var length: Int64
+        var instrument: Instrument
+        var notes: [RoundsNote]
+    }
+
+    /// MIDI loops from the manifest, with times scaled like audio lengths
+    /// when the session was saved at another sample rate.
+    nonisolated private static func loadNotes(_ manifest: SessionManifest, sampleRate: Double) -> [Int: MIDILoop] {
+        let ratio = sampleRate / manifest.sampleRate
+        let baseSamples = manifest.loops.first { $0.slot == manifest.baseLoop }?.samples
+        let newBase = baseSamples.map { Int64((Double($0) * ratio / 8).rounded()) * 8 }
+        var result: [Int: MIDILoop] = [:]
+        for loop in manifest.loops {
+            guard let notes = loop.notes, let samples = loop.samples, samples > 1,
+                  loop.slot >= 0 && loop.slot < Int(ROUNDS_MAX_LOOPS) else { continue }
+            var length = samples
+            if ratio != 1 {
+                if let baseSamples, let newBase {
+                    length = Int64((Double(newBase) * Double(samples) / Double(baseSamples)).rounded())
+                } else {
+                    length = Int64((Double(samples) * ratio).rounded())
+                }
+            }
+            let scale = Double(length) / Double(samples)
+            let converted: [RoundsNote] = notes.compactMap { n in
+                guard n.count == 4 else { return nil }
+                return RoundsNote(start: Int64((Double(n[0]) * scale).rounded()) % length,
+                                  length: max(1, Int64((Double(n[1]) * scale).rounded())),
+                                  note: Int32(clamping: n[2]), velocity: Int32(clamping: n[3]))
+            }
+            let instrument = loop.instrument.flatMap(Instrument.init(name:)) ?? .subBass
+            result[loop.slot] = MIDILoop(length: length, instrument: instrument, notes: converted)
+        }
+        return result
     }
 
     /// The audio thread copies a slice per block; wait for it here.

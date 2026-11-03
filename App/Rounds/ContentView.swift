@@ -11,11 +11,14 @@ struct ContentView: View {
             transport
             Divider()
             HStack(alignment: .top, spacing: 16) {
-                VStack(alignment: .leading, spacing: 16) {
-                    LoopLanes()
-                    loopPanel
-                    controls
-                    footswitchLegend
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        LoopLanes()
+                        SoundsPanel()
+                        loopPanel
+                        controls
+                        footswitchLegend
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .topLeading)
                 if model.showLog {
@@ -25,7 +28,7 @@ struct ContentView: View {
             }
             .padding(16)
         }
-        .frame(minWidth: 980, minHeight: 820)
+        .frame(minWidth: 1100, minHeight: 860)
         .focusable()
         .focused($focused)
         .focusEffectDisabled()
@@ -281,6 +284,11 @@ struct LoopLane: View {
             Text(lengthText)
                 .font(.system(.callout, design: .monospaced))
                 .frame(width: 120, alignment: .leading)
+            Text(kindText)
+                .font(.callout)
+                .foregroundStyle(loop.midi ? Color.blue : .secondary)
+                .lineLimit(1)
+                .frame(width: 150, alignment: .leading)
             ProgressView(value: loop.state == .recording ? 1 : loop.position)
                 .tint(loop.state == .empty ? .secondary : loop.color)
                 .animation(nil, value: loop.position)
@@ -304,12 +312,135 @@ struct LoopLane: View {
         }
     }
 
+    private var kindText: String {
+        switch loop.state {
+        case .empty: return ""
+        case .recording where !loop.midi: return "Audio (or play keys)"
+        default:
+            guard loop.midi else { return "Audio" }
+            return "♪ \(loop.instrument.name) · \(loop.notes) note\(loop.notes == 1 ? "" : "s")"
+        }
+    }
+
     private var stateText: String {
         switch loop.queued {
         case .none: return loop.state.label
         case .tap: return loop.state == .empty ? "Record next bar" : "Play next bar"
         case .stop: return "Stop next bar"
         }
+    }
+}
+
+// MARK: - Drum pads and keys
+
+struct SoundsPanel: View {
+    @EnvironmentObject var model: LooperModel
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 16) {
+            drums
+            Divider()
+            keys.frame(width: 220)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color(nsColor: .controlBackgroundColor)))
+    }
+
+    private var drums: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Drum pads").font(.headline)
+                Text("bottom pad row").foregroundStyle(.secondary).font(.callout)
+                Spacer()
+                Picker("Kit", selection: Binding(get: { currentKit }, set: { model.selectKit($0) })) {
+                    ForEach(Instrument.kits) { Text($0.name).tag($0) }
+                }
+                .frame(width: 170)
+            }
+            Text(recordsTo).font(.callout).foregroundStyle(.secondary)
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+                HStack(spacing: 6) {
+                    ForEach(0..<8, id: \.self) { pad in
+                        DrumPadCard(pad: pad, flash: flash(pad, at: context.date))
+                            .onTapGesture { model.hitPad(pad) }
+                    }
+                }
+            }
+        }
+    }
+
+    private var keys: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Keys play").font(.headline)
+                Text("Track ◀ ▶").foregroundStyle(.secondary).font(.callout)
+            }
+            ForEach(Instrument.synths) { instrument in
+                HStack {
+                    Text(instrument.name)
+                    Spacer()
+                    Text(usedBy(instrument)).font(.caption)
+                        .foregroundStyle(instrument == model.keysInstrument ? Color.white.opacity(0.85) : .secondary)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(RoundedRectangle(cornerRadius: 5)
+                    .fill(instrument == model.keysInstrument ? Color.accentColor : Color.clear))
+                .foregroundStyle(instrument == model.keysInstrument ? Color.white : .primary)
+                .contentShape(Rectangle())
+                .onTapGesture { model.selectInstrument(instrument) }
+            }
+            Text(keysNote).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var currentKit: Instrument {
+        model.drumLoop.map { model.loops[$0].instrument } ?? model.kit
+    }
+
+    private var recordsTo: String {
+        let selected = model.loops[model.selectedLoop]
+        if selected.state == .empty || (selected.state == .recording && !selected.midi) {
+            return "Record loop \(model.selectedLoop + 1) and hit the pads: it becomes a drum loop"
+        }
+        if let loop = model.drumLoop { return "Records to loop \(loop + 1) when it records or overdubs" }
+        return "No drum loop yet: select an empty loop and record to make one"
+    }
+
+    private var keysNote: String {
+        let loop = model.loops[model.selectedLoop]
+        if loop.state == .empty { return "Record loop \(loop.id + 1) and play the keys: it becomes a MIDI loop" }
+        if loop.midi { return "Playing loop \(loop.id + 1)'s instrument; picking another switches it" }
+        return "Loop \(loop.id + 1) is audio: the keys just play along"
+    }
+
+    private func usedBy(_ instrument: Instrument) -> String {
+        model.loops.filter { $0.state != .empty && $0.midi && $0.instrument == instrument }
+            .map { "Loop \($0.id + 1)" }.joined(separator: ", ")
+    }
+
+    private func flash(_ pad: Int, at date: Date) -> Double {
+        guard let hit = model.lastHit, hit.pad == pad else { return 0 }
+        let age = date.timeIntervalSince(hit.time)
+        return age < 0.25 ? (1 - age / 0.25) * Double(hit.velocity) / 127 : 0
+    }
+}
+
+struct DrumPadCard: View {
+    let pad: Int
+    let flash: Double
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("PAD \(pad + 1)").font(.caption2).foregroundStyle(.secondary)
+            Text(DrumPads.names[pad]).font(.callout.weight(.medium)).lineLimit(1).minimumScaleFactor(0.8)
+            Text(DrumPads.noteNames[pad]).font(.caption2.monospaced()).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 58, alignment: .topLeading)
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.red.opacity(0.08 + 0.5 * flash)))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.25)))
+        .contentShape(Rectangle())
     }
 }
 
