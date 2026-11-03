@@ -1,6 +1,6 @@
 # Rounds: guitar + MIDI looper for macOS
 
-A focused live looper, a much simpler Ableton Session View with only what Corey needs. Controlled entirely from a Novation Launchkey 37 and a Yamaha FC5 footswitch (in the Launchkey's sustain jack). Guitar comes in through an audio interface.
+A focused live looper, a much simpler Ableton Session View with only what Corey needs. Controlled entirely from a Novation Launchkey 37 and a Yamaha FC5 footswitch (in the Launchkey's sustain jack). Guitar comes in through a Valeton GP-5 used as the USB audio interface ("GP-5 Audio": 2 in / 2 out at 44.1 kHz, headphones on the GP-5, which monitors the guitar directly, so Rounds' Monitor input stays off).
 
 Design references live in `design/`: `launchkey-37-mapping.png` (controller layout) and `main-window-mockup.html` (main window). Treat them as the source of truth for layout and behavior.
 
@@ -49,15 +49,21 @@ The app takes the Launchkey over in DAW/InControl mode so it can set pad LEDs an
 
 | Gesture | Action |
 |---|---|
-| Tap | Record → Overdub → Play (cycles) |
+| Tap | Record → Play → Overdub (cycles) |
 | Double-tap | Undo last layer |
 | Hold | Stop. Hold 2 s: clear |
 
-Gesture detection must not delay a single tap's action noticeably. Decide in the plan how tap vs double-tap is disambiguated (e.g. act on tap immediately, and have double-tap undo that action plus the previous layer) and confirm with Corey.
+A tap acts immediately on press (no waiting to see if a double-tap follows). Because that tap has already happened, double-tap and hold first revert what the tap did, then act: double-tap = revert the tap (e.g. drop the layer it just opened) and undo the last layer; hold = revert the tap and stop. A second press within 0.3 s is a double-tap; holding 0.6 s is a hold, 2 s a clear. This is implemented in `Core/src/footswitch.cpp` and `Looper::undoRevertingTap` / `stopRevertingTap`; Corey still has to confirm it feels right.
 
 ## Main window
 
 One screen (see mockup): header with session name, tempo, position (bar.beat.sixteenth / cycle bars), quantize, click on/off, input, footswitch indicator, "Import song → stems". Then the parts strip, the 8 loop lanes with waveform/MIDI previews, state badge and volume, the drum pad row with kit picker, the selected-loop panel (undo, ½ / ×2, clear), the keys instrument list, a live Launchkey mirror, and the footswitch legend. Plus an event log (MIDI and footswitch) toggleable from day one.
+
+## Building and testing
+
+- Core tests and timing harness (any OS): `cmake -S Core -B Core/build && cmake --build Core/build && ./Core/build/rounds_tests`. Run them after every core change.
+- Mac app: `./scripts/bootstrap.sh` (XcodeGen generates `Rounds.xcodeproj` from `project.yml`; the project file is not committed). CI builds the app on macOS for every PR.
+- Space bar stands in for the footswitch in the app.
 
 ## Hard problems (solve deliberately)
 
@@ -78,7 +84,5 @@ Save/load sessions lands as soon as there is something worth saving (by mileston
 
 ## Open questions
 
-- Audio interface: can the GP-5 act as a USB audio interface, or is a separate one (Focusrite, MOTU M2) used?
-- Footswitch tap vs double-tap disambiguation (see above).
 - Stem separation approach for milestone 6 (local model vs. external tool).
 - Does any MIDI need to go out to other apps, or is the built-in sound enough?

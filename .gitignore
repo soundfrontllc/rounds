@@ -4,3 +4,4 @@ DerivedData/
 .build/
 build/
 *.xcodeproj/project.xcworkspace/xcuserdata/
+Rounds.xcodeproj/

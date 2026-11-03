@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core-tests:
+    name: Core tests and timing harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cmake -S Core -B Core/build -DCMAKE_BUILD_TYPE=Release && cmake --build Core/build -j
+      - name: Run
+        run: ./Core/build/rounds_tests
+
+  mac-app:
+    name: Mac app build
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate
+      - name: Build
+        run: |
+          set -o pipefail
+          xcodebuild -project Rounds.xcodeproj -scheme Rounds -configuration Debug \
+            -destination 'platform=macOS' -derivedDataPath build/dd CODE_SIGNING_ALLOWED=NO build 2>&1 \
+            | tee build.log | grep -E "error:|warning:|BUILD SUCCEEDED|BUILD FAILED"
+      - name: Check the built app can ask for the microphone
+        # Without this key macOS feeds the app silence (or crashes it on request).
+        run: /usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" build/dd/Build/Products/Debug/Rounds.app/Contents/Info.plist
+      - name: Core tests with Apple clang
+        run: cmake -S Core -B Core/build -DCMAKE_BUILD_TYPE=Release && cmake --build Core/build -j && ./Core/build/rounds_tests
