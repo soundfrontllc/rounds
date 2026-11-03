@@ -33,6 +33,12 @@ public:
     explicit Looper(const Config& config);
 
     void setLatency(int inputLatency, int outputLatency);
+    // Length that closed loops snap to (1/8x ... 8x of it). 0 = this loop sets
+    // the base: its length is only rounded to a multiple of 8 samples.
+    void setBaseLength(int64_t baseLength) { baseLength_ = baseLength; }
+    // Moves the loop's phase; used to restart all loops together from the top.
+    void shiftOrigin(int64_t delta) { origin_ += delta; }
+    int64_t origin() const { return origin_; }
     int inputLatency() const { return inputLatency_; }
     int outputLatency() const { return outputLatency_; }
 
@@ -54,6 +60,16 @@ public:
     int closedLayers() const;
     bool layerOpen() const { return openLayer_ >= 0; }
     int64_t clock() const { return clock_; }
+    int64_t maxLoopSamples() const { return config_.maxLoopSamples; }
+
+    // Session save/load, a slice at a time from the audio thread.
+    // sampleAt() is what the loop plays at `index` (base plus every layer).
+    float sampleAt(int64_t index) const { return readLoop(index); }
+    // Empties the loop and writes `count` samples of a saved loop at `offset`.
+    void loadSlice(const float* samples, int64_t offset, int64_t count);
+    // Ends a load: the loop has `length` samples, is stopped, and index 0 is
+    // heard at real time `origin`.
+    void finishLoad(int64_t length, int64_t origin);
 
 private:
     enum class TapEffect { None, StartedRecording, FinishedRecording, OpenedLayer, ClosedLayer, Restarted };
@@ -70,6 +86,7 @@ private:
 
     void startRecording();
     bool finishRecording();    // false if the loop would be too short
+    int64_t snapLength(int64_t recorded, int64_t minimum) const;
     int openLayer();
     void closeLayer();
     void discardLayer(int slot);
@@ -98,6 +115,7 @@ private:
     bool baseWriting_ = false;
     int64_t loopLength_ = 0;
     int64_t origin_ = 0;      // real time at which loop index 0 is heard (mod length)
+    int64_t baseLength_ = 0;
 
     std::vector<Layer> layers_;
     std::vector<int> order_;  // slots of layers in the stack, oldest first

@@ -1,6 +1,7 @@
 #include "looper.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 namespace rounds {
@@ -66,8 +67,8 @@ void Looper::tap() {
             lastTap_ = TapEffect::OpenedLayer;
             break;
         case State::Stopped:
+            // Rejoin in phase; the engine moves the origin when nothing else plays.
             finishPendingWrites();
-            origin_ = clock_;
             state_ = State::Playing;
             lastTap_ = TapEffect::Restarted;
             break;
@@ -172,10 +173,27 @@ bool Looper::finishRecording() {
     const int64_t minimum =
         std::max<int64_t>(config_.minLoopSamples, inputLatency_ + outputLatency_ + 2 * config_.crossfadeSamples);
     if (length < minimum) return false;
-    loopLength_ = std::min(length, config_.maxLoopSamples);
+    loopLength_ = snapLength(std::min(length, config_.maxLoopSamples), minimum);
     // Input keeps arriving for inputLatency samples, plus crossfadeSamples of
     // overflow past the end for the seam crossfade; writeInput() finishes it.
     return true;
+}
+
+// If the snapped length is longer than what was played, recording carries on
+// to the new end (writeInput) and readLoop plays silence until it gets there.
+int64_t Looper::snapLength(int64_t recorded, int64_t minimum) const {
+    if (baseLength_ <= 0) return recorded - recorded % 8;
+    int64_t best = -1;
+    for (int64_t d = 8; d >= 1; d /= 2) {
+        const int64_t candidate = baseLength_ / d;
+        if (candidate < minimum) continue;
+        if (best < 0 || std::llabs(recorded - candidate) < std::llabs(recorded - best)) best = candidate;
+    }
+    for (int64_t m = 2; m <= 8 && baseLength_ * m <= config_.maxLoopSamples; m *= 2) {
+        const int64_t candidate = baseLength_ * m;
+        if (best < 0 || std::llabs(recorded - candidate) < std::llabs(recorded - best)) best = candidate;
+    }
+    return best > 0 ? best : recorded;
 }
 
 int Looper::freeSlot() const {
@@ -242,6 +260,22 @@ void Looper::finishPendingWrites() {
 }
 
 // ---------------------------------------------------------------------------
+// Session load
+
+void Looper::loadSlice(const float* samples, int64_t offset, int64_t count) {
+    if (offset == 0) clear();
+    count = std::min(count, config_.maxLoopSamples - offset);
+    if (count > 0) std::memcpy(&base_[static_cast<size_t>(offset)], samples, sizeof(float) * static_cast<size_t>(count));
+}
+
+void Looper::finishLoad(int64_t length, int64_t origin) {
+    clear();  // keeps base_, drops any layers
+    loopLength_ = std::min(length, config_.maxLoopSamples);
+    origin_ = origin;
+    state_ = State::Stopped;
+}
+
+// ---------------------------------------------------------------------------
 // Audio
 
 void Looper::writeInput(float sample, int64_t s) {
@@ -292,7 +326,9 @@ bool Looper::layerCovers(const Layer& layer, int64_t index) const {
 }
 
 float Looper::readLoop(int64_t index) const {
-    float sum = base_[static_cast<size_t>(index)];
+    // Not recorded yet (a loop that snapped longer than was played): silence,
+    // not whatever an earlier take left in the buffer.
+    float sum = baseWriting_ && index >= baseWritten_ ? 0.0f : base_[static_cast<size_t>(index)];
     for (size_t i = 0; i < order_.size(); i++) {
         const int slot = order_[i];
         if (slot == flattenSlot_ && index < flattenPos_) continue;  // already merged into base

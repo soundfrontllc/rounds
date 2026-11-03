@@ -74,7 +74,7 @@ One screen (see mockup): header with session name, tempo, position (bar.beat.six
 ## Milestones
 
 1. **Single-track audio looper.** Guitar in, footswitch tap/double-tap/hold working, event log, latency calibration. Timing test harness: records a click through a loopback, loops it, and reports measured latency and drift in samples. Get timing right here before anything else.
-2. **Multiple loops on one clock.** 8 slots, shorter loops repeat under the longest, top pads select loops, pad LEDs, knob volumes.
+2. **Multiple loops on one clock.** 8 slots, shorter loops repeat under the longest, top pads select loops, pad LEDs, knob volumes. Until bars arrive in milestone 3, the first loop recorded sets a base length and later loops snap to ⅛× … 8× of it (Corey's choice).
 3. **Tempo from first loop**, click, bar grid, quantize.
 4. **Drum pads and MIDI loops**, built-in instruments, keys follow the selected loop.
 5. **Parts**, switching at the end of the cycle, new part copies with shared loops.

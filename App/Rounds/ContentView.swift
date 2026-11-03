@@ -10,6 +10,7 @@ struct ContentView: View {
             Divider()
             HStack(alignment: .top, spacing: 16) {
                 VStack(alignment: .leading, spacing: 16) {
+                    LoopLanes()
                     loopPanel
                     controls
                     footswitchLegend
@@ -22,7 +23,7 @@ struct ContentView: View {
             }
             .padding(16)
         }
-        .frame(minWidth: 900, minHeight: 560)
+        .frame(minWidth: 980, minHeight: 820)
         .focusable()
         .focused($focused)
         .focusEffectDisabled()
@@ -38,6 +39,14 @@ struct ContentView: View {
     private var header: some View {
         HStack(spacing: 12) {
             Text("Rounds").font(.title2.weight(.semibold))
+            Text(model.sessionName).font(.title3).foregroundStyle(.secondary)
+            if model.sessionBusy { ProgressView().controlSize(.small) }
+            Button("Open…") { model.openSession() }
+                .disabled(!model.audioRunning || model.sessionBusy)
+                .help("Open a saved session (⌘O)")
+            Button("Save") { model.saveSession() }
+                .disabled(!model.audioRunning || model.sessionBusy)
+                .help("Save the loops and volumes to a session folder (⌘S)")
             Spacer()
             Picker("Interface", selection: $model.deviceID) {
                 ForEach(model.devices) { device in
@@ -57,8 +66,10 @@ struct ContentView: View {
             .frame(width: 120)
             Button(model.audioRunning ? "Restart audio" : "Start audio") { model.startAudio() }
                 .keyboardShortcut("r", modifiers: .command)
+                .disabled(model.sessionBusy)
             if model.audioRunning {
                 Button("Stop audio") { model.stopAudio() }
+                    .disabled(model.sessionBusy)
             }
         }
         .padding(.horizontal, 16)
@@ -70,6 +81,7 @@ struct ContentView: View {
     private var loopPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline) {
+                Text("Loop \(model.selectedLoop + 1)").font(.headline)
                 StateBadge(state: model.state)
                 Spacer()
                 Text(lengthText).font(.system(.title3, design: .monospaced))
@@ -90,6 +102,9 @@ struct ContentView: View {
                 Spacer()
                 Toggle("Monitor input", isOn: $model.monitorInput)
                     .help("Play the input through Rounds. Leave off if your interface or GP-5 already monitors.")
+            }
+            if let message = model.sessionMessage {
+                Text(message).foregroundStyle(.red).font(.callout)
             }
             if let error = model.audioError {
                 HStack {
@@ -165,6 +180,83 @@ struct ContentView: View {
         }
         .padding(16)
         .background(RoundedRectangle(cornerRadius: 12).fill(Color(nsColor: .controlBackgroundColor)))
+    }
+}
+
+// MARK: - Loop lanes
+
+extension LoopInfo {
+    /// Matches the slot's pad colour on the Launchkey (LooperModel.slotColors).
+    var color: Color {
+        [Color.orange, .blue, .pink, .purple, .green, .cyan, .yellow, .gray][id]
+    }
+}
+
+struct LoopLanes: View {
+    @EnvironmentObject var model: LooperModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Loops").font(.headline)
+                Spacer()
+                Text(baseText).font(.callout).foregroundStyle(.secondary)
+            }
+            ForEach(model.loops) { loop in
+                LoopLane(loop: loop, selected: loop.id == model.selectedLoop)
+                    .contentShape(Rectangle())
+                    .onTapGesture { model.selectedLoop = loop.id }
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color(nsColor: .controlBackgroundColor)))
+    }
+
+    private var baseText: String {
+        guard model.baseLoop >= 0 else { return "The first loop recorded sets the length the others snap to" }
+        return String(format: "Base %.2f s, set by loop %d", model.baseSeconds, model.baseLoop + 1)
+    }
+}
+
+struct LoopLane: View {
+    @EnvironmentObject var model: LooperModel
+    let loop: LoopInfo
+    let selected: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text("\(loop.id + 1)")
+                .font(.system(.callout, design: .monospaced).weight(.semibold))
+                .frame(width: 22, height: 22)
+                .background(Circle().fill(loop.state == .empty ? Color.secondary.opacity(0.2) : loop.color))
+            Text(loop.state.label)
+                .font(.callout)
+                .foregroundStyle(loop.state.color)
+                .frame(width: 90, alignment: .leading)
+            Text(lengthText)
+                .font(.system(.callout, design: .monospaced))
+                .frame(width: 120, alignment: .leading)
+            ProgressView(value: loop.state == .recording ? 1 : loop.position)
+                .tint(loop.state == .empty ? .secondary : loop.color)
+                .animation(nil, value: loop.position)
+            LevelMeter(label: "", level: loop.level).frame(width: 70)
+            Slider(value: Binding(get: { Double(loop.gain) }, set: { model.setGain(loop.id, Float($0)) }), in: 0...1)
+                .frame(width: 110)
+                .help("Volume (knob \(loop.id + 1) on the Launchkey)")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(RoundedRectangle(cornerRadius: 6).fill(selected ? Color.accentColor.opacity(0.15) : .clear))
+    }
+
+    private var lengthText: String {
+        switch loop.state {
+        case .empty: return "—"
+        case .recording: return String(format: "%.2f s", loop.seconds)
+        default:
+            guard model.baseSeconds > 0, model.baseLoop != loop.id else { return String(format: "%.2f s", loop.seconds) }
+            return String(format: "%.2f s  %@", loop.seconds, model.ratioText(loop.seconds / model.baseSeconds))
+        }
     }
 }
 

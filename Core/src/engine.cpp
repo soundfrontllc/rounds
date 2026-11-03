@@ -20,26 +20,32 @@ void storeMax(std::atomic<float>& target, float value) {
     while (value > current && !target.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
     }
 }
+
+bool validLoop(int loop) { return loop >= 0 && loop < Engine::kLoops; }
 }  // namespace
 
 Engine::Engine(double sampleRate, double maxLoopSeconds, int maxBlockFrames)
-    : sampleRate_(sampleRate),
-      maxBlock_(maxBlockFrames),
-      looper_(looperConfig(sampleRate, maxLoopSeconds)),
-      probe_(sampleRate) {
+    : sampleRate_(sampleRate), maxBlock_(maxBlockFrames), probe_(sampleRate) {
+    for (int i = 0; i < kLoops; i++) {
+        loops_.push_back(std::make_unique<Looper>(looperConfig(sampleRate, maxLoopSeconds)));
+        loopGain_[static_cast<size_t>(i)].store(1.0f);
+    }
     zeros_.assign(static_cast<size_t>(maxBlockFrames), 0.0f);
+    scratch_.assign(static_cast<size_t>(maxBlockFrames), 0.0f);
+    transferBuffer_.assign(static_cast<size_t>(loops_[0]->maxLoopSamples()), 0.0f);
 }
 
 // ---------------------------------------------------------------------------
 // Non-real-time side
 
-bool Engine::send(RoundsCommand cmd, int64_t sampleTime) {
+bool Engine::send(int loop, RoundsCommand cmd, int64_t sampleTime) {
+    if (!validLoop(loop)) return false;
     std::lock_guard<std::mutex> lock(producerMutex_);
-    return commands_.push(Command{cmd, sampleTime});
+    return commands_.push(Command{loop, cmd, sampleTime});
 }
 
-bool Engine::sendAtHostTime(RoundsCommand cmd, uint64_t hostTime) {
-    if (hostTime == 0) return send(cmd, -1);
+bool Engine::sendAtHostTime(int loop, RoundsCommand cmd, uint64_t hostTime) {
+    if (hostTime == 0) return send(loop, cmd, -1);
     uint64_t mapHost;
     int64_t mapSample;
     double ticksPerSample;
@@ -52,12 +58,12 @@ bool Engine::sendAtHostTime(RoundsCommand cmd, uint64_t hostTime) {
         std::atomic_thread_fence(std::memory_order_acquire);
     } while ((seq & 1u) || seq != mapSeq_.load(std::memory_order_relaxed));
 
-    if (ticksPerSample <= 0.0) return send(cmd, -1);
+    if (ticksPerSample <= 0.0) return send(loop, cmd, -1);
     const double deltaTicks = static_cast<double>(hostTime) - static_cast<double>(mapHost);
     const int64_t sampleAt = mapSample + static_cast<int64_t>(std::llround(deltaTicks / ticksPerSample));
     // One block of fixed delay: the moment has usually already been rendered,
     // and a constant delay feels tighter than a jittery one.
-    return send(cmd, sampleAt + statBlock_.load(std::memory_order_relaxed));
+    return send(loop, cmd, sampleAt + statBlock_.load(std::memory_order_relaxed));
 }
 
 void Engine::setLatency(int inputLatency, int outputLatency) {
@@ -65,13 +71,13 @@ void Engine::setLatency(int inputLatency, int outputLatency) {
     outputLatency_.store(outputLatency);
 }
 
+void Engine::setLoopGain(int loop, float gain) {
+    if (validLoop(loop)) loopGain_[static_cast<size_t>(loop)].store(std::max(0.0f, gain));
+}
+
 void Engine::getStatus(RoundsStatus* out) {
-    out->state = statState_.load();
-    out->loopLength = statLength_.load();
-    out->recordedLength = statRecorded_.load();
-    out->playPosition = statPosition_.load();
-    out->layers = statLayers_.load();
-    out->layerOpen = statLayerOpen_.load();
+    out->baseLength = statBase_.load();
+    out->baseLoop = statBaseLoop_.load();
     out->inputPeak = statInputPeak_.exchange(0.0f);
     out->outputPeak = statOutputPeak_.exchange(0.0f);
     out->inputLatency = inputLatency_.load();
@@ -81,49 +87,200 @@ void Engine::getStatus(RoundsStatus* out) {
     out->sampleRate = sampleRate_;
 }
 
+void Engine::getLoopStatus(int loop, RoundsLoopStatus* out) {
+    *out = RoundsLoopStatus{};
+    if (!validLoop(loop)) return;
+    LoopStats& s = loopStats_[static_cast<size_t>(loop)];
+    out->state = s.state.load();
+    out->loopLength = s.length.load();
+    out->recordedLength = s.recorded.load();
+    out->playPosition = s.position.load();
+    out->layers = s.layers.load();
+    out->layerOpen = s.layerOpen.load();
+    out->peak = s.peak.exchange(0.0f);
+    out->gain = loopGain_[static_cast<size_t>(loop)].load();
+}
+
+// ---------------------------------------------------------------------------
+// Session transfer (non-real-time side)
+
+bool Engine::beginExport(int loop) {
+    if (!validLoop(loop) || transfer_.load(std::memory_order_acquire) != kIdle) return false;
+    transferLoop_ = loop;
+    transfer_.store(kExportRequested, std::memory_order_release);
+    return true;
+}
+
+bool Engine::beginImport(int loop, const float* samples, int64_t length) {
+    if (!validLoop(loop) || length <= 0 || length > maxLoopSamples()) return false;
+    if (transfer_.load(std::memory_order_acquire) != kIdle) return false;
+    std::memcpy(transferBuffer_.data(), samples, sizeof(float) * static_cast<size_t>(length));
+    transferLoop_ = loop;
+    transferLength_ = length;
+    transfer_.store(kImportRequested, std::memory_order_release);
+    return true;
+}
+
+// 0 = idle, 1 = in progress, 2 = done, -1 = failed. A finished import or a
+// failure returns to idle here; a finished export in takeExport().
+int Engine::transferStatus() {
+    switch (transfer_.load(std::memory_order_acquire)) {
+        case kIdle: return 0;
+        case kExportDone: return 2;
+        case kImportDone: transfer_.store(kIdle, std::memory_order_release); return 2;
+        case kFailed: transfer_.store(kIdle, std::memory_order_release); return -1;
+        default: return 1;
+    }
+}
+
+int64_t Engine::takeExport(float* dest, int64_t capacity) {
+    if (transfer_.load(std::memory_order_acquire) != kExportDone) return -1;
+    const int64_t length = transferLength_;
+    if (length > capacity) return -1;
+    std::memcpy(dest, transferBuffer_.data(), sizeof(float) * static_cast<size_t>(length));
+    transfer_.store(kIdle, std::memory_order_release);
+    return length;
+}
+
 // ---------------------------------------------------------------------------
 // Real-time side
 
-void Engine::emit(RoundsEventType type, int64_t value) {
-    events_.push(RoundsEvent{type, value, now_});  // dropped if the UI isn't reading
+void Engine::emit(RoundsEventType type, int loop, int64_t value) {
+    events_.push(RoundsEvent{type, loop, value, now_});  // dropped if the UI isn't reading
 }
 
-void Engine::apply(int32_t cmd) {
+bool Engine::anyAudible() const {
+    for (const auto& looper : loops_) {
+        if (looper->state() == Looper::State::Playing || looper->state() == Looper::State::Overdubbing) return true;
+    }
+    return false;
+}
+
+bool Engine::importing(int loop) const {
+    const int state = transfer_.load(std::memory_order_relaxed);
+    return (state == kImportRequested || state == kImporting) && loop == transferLoop_;
+}
+
+void Engine::apply(int loop, int32_t cmd) {
+    if (importing(loop)) return;  // the loop is being loaded from a session
+    Looper& looper = *loops_[static_cast<size_t>(loop)];
+    looper.setBaseLength(baseLength_);
     switch (cmd) {
-        case ROUNDS_CMD_TAP: looper_.tap(); break;
-        case ROUNDS_CMD_UNDO: looper_.undo(); break;
-        case ROUNDS_CMD_STOP: looper_.stop(); break;
-        case ROUNDS_CMD_CLEAR: looper_.clear(); break;
-        case ROUNDS_CMD_UNDO_REVERTING_TAP: looper_.undoRevertingTap(); break;
-        case ROUNDS_CMD_STOP_REVERTING_TAP: looper_.stopRevertingTap(); break;
+        case ROUNDS_CMD_TAP:
+            if (looper.state() == Looper::State::Stopped && !anyAudible()) {
+                // Nothing playing: start this loop from the top, and move every
+                // loop's phase with it so they stay in step with each other.
+                const int64_t delta = looper.clock() - looper.origin();
+                for (auto& other : loops_) other->shiftOrigin(delta);
+            }
+            looper.tap();
+            break;
+        case ROUNDS_CMD_UNDO: looper.undo(); break;
+        case ROUNDS_CMD_STOP: looper.stop(); break;
+        case ROUNDS_CMD_CLEAR: looper.clear(); break;
+        case ROUNDS_CMD_UNDO_REVERTING_TAP: looper.undoRevertingTap(); break;
+        case ROUNDS_CMD_STOP_REVERTING_TAP: looper.stopRevertingTap(); break;
         default: break;
     }
+    updateBase();
     publish();
 }
 
+// The first loop to get a length sets the base; it resets once every loop is empty.
+void Engine::updateBase() {
+    bool anyLoop = false;
+    for (int i = 0; i < kLoops; i++) {
+        const Looper& looper = *loops_[static_cast<size_t>(i)];
+        if (looper.state() != Looper::State::Empty) anyLoop = true;
+        if (baseLength_ == 0 && looper.loopLength() > 0) {
+            baseLength_ = looper.loopLength();
+            baseLoop_ = i;
+        }
+    }
+    if (!anyLoop) {
+        baseLength_ = 0;
+        baseLoop_ = -1;
+    }
+}
+
 void Engine::publish() {
-    const int state = static_cast<int>(looper_.state());
     // Looper::State and RoundsLoopState share their order.
     static_assert(static_cast<int>(Looper::State::Stopped) == ROUNDS_LOOP_STOPPED, "state order");
-    if (state != lastState_) {
-        lastState_ = state;
-        emit(ROUNDS_EVENT_STATE_CHANGED, state);
+    for (int i = 0; i < kLoops; i++) {
+        const Looper& looper = *loops_[static_cast<size_t>(i)];
+        Published& last = published_[static_cast<size_t>(i)];
+        const int state = static_cast<int>(looper.state());
+        if (state != last.state) {
+            last.state = state;
+            emit(ROUNDS_EVENT_STATE_CHANGED, i, state);
+        }
+        if (looper.loopLength() != last.length) {
+            last.length = looper.loopLength();
+            emit(ROUNDS_EVENT_LOOP_LENGTH, i, last.length);
+        }
+        if (looper.closedLayers() != last.layers) {
+            last.layers = looper.closedLayers();
+            emit(ROUNDS_EVENT_LAYER_COUNT, i, last.layers);
+        }
     }
-    if (looper_.loopLength() != lastLength_) {
-        lastLength_ = looper_.loopLength();
-        emit(ROUNDS_EVENT_LOOP_LENGTH, lastLength_);
+}
+
+// Copies one slice of the current save or load. Runs after the block is
+// rendered, so a loaded loop never plays half-written.
+void Engine::stepTransfer() {
+    const int state = transfer_.load(std::memory_order_acquire);
+    if (state == kIdle || state == kExportDone || state == kImportDone || state == kFailed) return;
+    Looper& looper = *loops_[static_cast<size_t>(transferLoop_)];
+
+    if (state == kExportRequested) {
+        const auto s = looper.state();
+        if (looper.loopLength() <= 0 || s == Looper::State::Recording) {
+            transfer_.store(kFailed, std::memory_order_release);
+            return;
+        }
+        transferLength_ = looper.loopLength();
+        transferPos_ = 0;
+        // Saved sample k is what played at real time ref + k, with ref the
+        // base loop's top, so every saved loop lines up with the others.
+        const int64_t ref = baseLoop_ >= 0 ? loops_[static_cast<size_t>(baseLoop_)]->origin() : looper.origin();
+        transferRotation_ = ((ref - looper.origin()) % transferLength_ + transferLength_) % transferLength_;
+        transfer_.store(kExporting, std::memory_order_relaxed);
+    } else if (state == kImportRequested) {
+        transferPos_ = 0;
+        transfer_.store(kImporting, std::memory_order_relaxed);
     }
-    if (looper_.closedLayers() != lastLayers_) {
-        lastLayers_ = looper_.closedLayers();
-        emit(ROUNDS_EVENT_LAYER_COUNT, lastLayers_);
+
+    const int64_t end = std::min(transferLength_, transferPos_ + kTransferSlice);
+    if (transfer_.load(std::memory_order_relaxed) == kExporting) {
+        // Re-recorded or cleared mid-save: the copy would mix two takes.
+        if (looper.loopLength() != transferLength_ || looper.state() == Looper::State::Recording) {
+            transfer_.store(kFailed, std::memory_order_release);
+            return;
+        }
+        for (int64_t k = transferPos_; k < end; k++) {
+            transferBuffer_[static_cast<size_t>(k)] = looper.sampleAt((k + transferRotation_) % transferLength_);
+        }
+        transferPos_ = end;
+        if (transferPos_ >= transferLength_) transfer_.store(kExportDone, std::memory_order_release);
+    } else {
+        looper.loadSlice(transferBuffer_.data() + transferPos_, transferPos_, end - transferPos_);
+        transferPos_ = end;
+        if (transferPos_ >= transferLength_) {
+            // Every loaded loop shares origin 0, so a session's loops come
+            // back in the phase they were saved in.
+            looper.finishLoad(transferLength_, 0);
+            updateBase();
+            publish();
+            transfer_.store(kImportDone, std::memory_order_release);
+        }
     }
 }
 
 void Engine::processChunk(const float* input, float* out, int frames) {
     if (frames <= 0) return;
     if (probe_.active()) {
-        // While calibrating the looper hears silence and stays quiet.
-        looper_.process(zeros_.data(), out, frames, 0.0f);
+        // While calibrating the loopers hear silence and stay quiet.
+        for (auto& looper : loops_) looper->process(zeros_.data(), out, frames, 0.0f);
         for (int i = 0; i < frames; i++) out[i] = probe_.process(input[i]);
         if (probe_.takeFinished()) {
             const int64_t roundTrip = probe_.result();
@@ -136,11 +293,21 @@ void Engine::processChunk(const float* input, float* out, int frames) {
                 inputLatency_.store(newIn);
                 outputLatency_.store(static_cast<int>(roundTrip) - newIn);
             }
-            emit(ROUNDS_EVENT_CALIBRATION_DONE, roundTrip);
+            emit(ROUNDS_EVENT_CALIBRATION_DONE, -1, roundTrip);
         }
         return;
     }
-    looper_.process(input, out, frames, loopGain_.load(std::memory_order_relaxed));
+    for (int l = 0; l < kLoops; l++) {
+        std::memset(scratch_.data(), 0, sizeof(float) * static_cast<size_t>(frames));
+        loops_[static_cast<size_t>(l)]->process(input, scratch_.data(), frames,
+                                                 loopGain_[static_cast<size_t>(l)].load(std::memory_order_relaxed));
+        float peak = chunkPeak_[static_cast<size_t>(l)];
+        for (int i = 0; i < frames; i++) {
+            out[i] += scratch_[static_cast<size_t>(i)];
+            peak = std::max(peak, std::fabs(scratch_[static_cast<size_t>(i)]));
+        }
+        chunkPeak_[static_cast<size_t>(l)] = peak;
+    }
     const float monitor = monitorGain_.load(std::memory_order_relaxed);
     if (monitor > 0.0f) {
         for (int i = 0; i < frames; i++) out[i] += input[i] * monitor;
@@ -166,7 +333,7 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
     const int in = inputLatency_.load(std::memory_order_relaxed);
     const int out = outputLatency_.load(std::memory_order_relaxed);
     if (in != appliedInputLatency_ || out != appliedOutputLatency_) {
-        looper_.setLatency(in, out);
+        for (auto& looper : loops_) looper->setLatency(in, out);
         appliedInputLatency_ = in;
         appliedOutputLatency_ = out;
     }
@@ -187,15 +354,16 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
     }
 
     std::memset(outL, 0, sizeof(float) * static_cast<size_t>(frames));
+    chunkPeak_.fill(0.0f);
 
     // Render in chunks split exactly at command times.
     int pos = 0;
     while (pos < frames) {
         while (pendingCount_ > 0 && pending_[0].time <= now_ + pos) {
-            const int32_t cmd = pending_[0].cmd;
+            const Command command = pending_[0];
             for (int i = 1; i < pendingCount_; i++) pending_[i - 1] = pending_[i];
             pendingCount_--;
-            apply(cmd);
+            apply(command.loop, command.cmd);
         }
         int chunk = frames - pos;
         if (pendingCount_ > 0) chunk = static_cast<int>(std::min<int64_t>(chunk, pending_[0].time - (now_ + pos)));
@@ -212,15 +380,24 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
     if (outR) std::memcpy(outR, outL, sizeof(float) * static_cast<size_t>(frames));
 
     now_ += frames;
+    stepTransfer();
+    updateBase();  // a loop can close itself when it runs out of room
     publish();
     storeMax(statInputPeak_, inPeak);
     storeMax(statOutputPeak_, outPeak);
-    statState_.store(static_cast<int>(looper_.state()), std::memory_order_relaxed);
-    statLength_.store(looper_.loopLength(), std::memory_order_relaxed);
-    statRecorded_.store(looper_.recordedLength(), std::memory_order_relaxed);
-    statPosition_.store(looper_.heardPosition(), std::memory_order_relaxed);
-    statLayers_.store(looper_.closedLayers(), std::memory_order_relaxed);
-    statLayerOpen_.store(looper_.layerOpen() ? 1 : 0, std::memory_order_relaxed);
+    for (int l = 0; l < kLoops; l++) {
+        const Looper& looper = *loops_[static_cast<size_t>(l)];
+        LoopStats& s = loopStats_[static_cast<size_t>(l)];
+        storeMax(s.peak, chunkPeak_[static_cast<size_t>(l)]);
+        s.state.store(static_cast<int>(looper.state()), std::memory_order_relaxed);
+        s.length.store(looper.loopLength(), std::memory_order_relaxed);
+        s.recorded.store(looper.recordedLength(), std::memory_order_relaxed);
+        s.position.store(looper.heardPosition(), std::memory_order_relaxed);
+        s.layers.store(looper.closedLayers(), std::memory_order_relaxed);
+        s.layerOpen.store(looper.layerOpen() ? 1 : 0, std::memory_order_relaxed);
+    }
+    statBase_.store(baseLength_, std::memory_order_relaxed);
+    statBaseLoop_.store(baseLoop_, std::memory_order_relaxed);
     statCalibrating_.store(probe_.active() ? 1 : 0, std::memory_order_relaxed);
     statNow_.store(now_, std::memory_order_relaxed);
 }

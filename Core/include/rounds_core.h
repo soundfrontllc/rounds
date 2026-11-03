@@ -20,6 +20,10 @@ extern "C" {
 
 typedef struct RoundsEngine RoundsEngine;
 
+// Loop slots. All loops run on one sample clock. The first loop recorded sets
+// the base length; later loops snap to 1/8x ... 8x of it so they stay in step.
+#define ROUNDS_MAX_LOOPS 8
+
 typedef enum {
     ROUNDS_LOOP_EMPTY = 0,
     ROUNDS_LOOP_RECORDING = 1,
@@ -52,6 +56,7 @@ typedef enum {
 
 typedef struct {
     int32_t type;          // RoundsEventType
+    int32_t loop;          // loop slot, or -1 for engine-wide events
     int64_t value;
     int64_t sampleTime;    // engine sample clock when it happened
 } RoundsEvent;
@@ -63,6 +68,13 @@ typedef struct {
     int64_t playPosition;   // index heard right now, 0..loopLength
     int32_t layers;         // closed overdub layers
     int32_t layerOpen;      // 1 while an overdub layer is being written
+    float peak;             // loop's output since last status read, linear
+    float gain;
+} RoundsLoopStatus;
+
+typedef struct {
+    int64_t baseLength;     // samples; 0 until the first loop is recorded
+    int32_t baseLoop;       // slot that set the base length, -1 if none
     float inputPeak;        // since last status read, linear 0..1+
     float outputPeak;
     int32_t inputLatency;   // samples, as used for compensation
@@ -72,8 +84,8 @@ typedef struct {
     double sampleRate;
 } RoundsStatus;
 
-// maxLoopSeconds bounds memory: all loop and layer buffers are allocated here,
-// never on the audio thread.
+// maxLoopSeconds bounds memory per loop slot: all loop and layer buffers are
+// allocated here, never on the audio thread.
 RoundsEngine* rounds_engine_create(double sampleRate, double maxLoopSeconds, int32_t maxBlockFrames);
 void rounds_engine_destroy(RoundsEngine* engine);
 
@@ -86,28 +98,50 @@ void rounds_engine_process(RoundsEngine* engine, const float* input, float* outL
 void rounds_engine_process_timed(RoundsEngine* engine, const float* input, float* outL, float* outR,
                                  int32_t frames, uint64_t hostTime, double hostTicksPerSample);
 
-// Queue a command. sampleTime < 0 means "as soon as possible". Returns 0 if
-// the queue was full.
-int32_t rounds_engine_send(RoundsEngine* engine, RoundsCommand cmd, int64_t sampleTime);
+// Queue a command for loop slot `loop`. sampleTime < 0 means "as soon as
+// possible". Returns 0 if the queue was full or the slot is out of range.
+int32_t rounds_engine_send(RoundsEngine* engine, int32_t loop, RoundsCommand cmd, int64_t sampleTime);
 
 // Queue a command stamped with a host time (e.g. a CoreMIDI timestamp). The
 // command is applied a fixed one block after that moment, so its timing has
 // constant latency instead of jitter. hostTime 0 means "now".
-int32_t rounds_engine_send_at_host_time(RoundsEngine* engine, RoundsCommand cmd, uint64_t hostTime);
+int32_t rounds_engine_send_at_host_time(RoundsEngine* engine, int32_t loop, RoundsCommand cmd, uint64_t hostTime);
 
 // Latency used to line recorded audio up with what was heard. Samples.
 void rounds_engine_set_latency(RoundsEngine* engine, int32_t inputLatency, int32_t outputLatency);
 // Gain for passing the input straight to the output (0 = off).
 void rounds_engine_set_monitor_gain(RoundsEngine* engine, float gain);
-void rounds_engine_set_loop_gain(RoundsEngine* engine, float gain);
+void rounds_engine_set_loop_gain(RoundsEngine* engine, int32_t loop, float gain);
 
 // Play clicks and measure how long they take to come back in. Needs the
 // output physically looped back to the input (a cable), or a mic near the speaker.
 void rounds_engine_start_calibration(RoundsEngine* engine);
 
 void rounds_engine_get_status(RoundsEngine* engine, RoundsStatus* out);
+void rounds_engine_get_loop_status(RoundsEngine* engine, int32_t loop, RoundsLoopStatus* out);
 // Returns 1 and fills `out` if an event was waiting.
 int32_t rounds_engine_poll_event(RoundsEngine* engine, RoundsEvent* out);
+
+// Session save/load. One loop at a time; the audio thread copies a slice per
+// block, so a save or load never glitches playback. Poll transfer_status
+// until it is no longer 1 (it needs the audio running).
+//
+// Save: begin_export(loop), wait for 2, then take_export(dest, capacity)
+// returns the loop's length in samples (-1 on failure). Saved loops are
+// rotated to line up with the base loop's start, so loops saved together
+// play back in step.
+// Load: begin_import(loop, samples, length) copies the samples right away;
+// the loop then fills in and ends up stopped. Load the base loop first: the
+// first loop to finish loading into an empty engine becomes the base.
+// Every loaded loop starts at index 0 together, so tapping one starts them in step.
+int64_t rounds_engine_max_loop_samples(RoundsEngine* engine);
+int32_t rounds_engine_begin_export(RoundsEngine* engine, int32_t loop);
+int32_t rounds_engine_begin_import(RoundsEngine* engine, int32_t loop, const float* samples, int64_t length);
+// 0 = idle, 1 = in progress, 2 = done, -1 = failed (loop empty, recording, or
+// re-recorded mid-save). Reading 2 after an import, or -1, frees the engine
+// for the next transfer.
+int32_t rounds_engine_transfer_status(RoundsEngine* engine);
+int64_t rounds_engine_take_export(RoundsEngine* engine, float* dest, int64_t capacity);
 
 // ---------------------------------------------------------------------------
 // Footswitch gestures (pure logic, no audio)

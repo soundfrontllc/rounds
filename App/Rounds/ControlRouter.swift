@@ -8,6 +8,9 @@ final class ControlRouter: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var engine: OpaquePointer?
     private var pedalDown = false
+    /// The loop the footswitch, Record and the window's buttons act on.
+    private var selected: Int32 = 0
+    private var gestureLoop: Int32 = 0
 
     /// Called on the main thread with each gesture, for the event log and UI.
     var onGesture: ((RoundsGesture) -> Void)?
@@ -30,6 +33,12 @@ final class ControlRouter: @unchecked Sendable {
         queue.sync { self.engine = engine }
     }
 
+    /// Queued behind any pedal press already received, so a press made just
+    /// before selecting still acts on the loop that was selected at the time.
+    func select(loop: Int) {
+        queue.async { self.selected = Int32(loop) }
+    }
+
     /// Footswitch state change. hostTime is the CoreMIDI timestamp (0 = now).
     func pedal(down: Bool, hostTime: UInt64) {
         let stamp = hostTime == 0 ? rounds_host_time_now() : hostTime
@@ -45,11 +54,21 @@ final class ControlRouter: @unchecked Sendable {
         }
     }
 
+    /// A single tap from a hardware button (the Launchkey's Record), scheduled
+    /// at the moment it was pressed like a footswitch tap, without gestures.
+    func tap(hostTime: UInt64) {
+        let stamp = hostTime == 0 ? rounds_host_time_now() : hostTime
+        queue.async {
+            guard let engine = self.engine else { return }
+            rounds_engine_send_at_host_time(engine, self.selected, ROUNDS_CMD_TAP, stamp)
+        }
+    }
+
     /// A button in the UI. Sent "now", not scheduled.
     func send(_ command: RoundsCommand) {
         queue.async {
             guard let engine = self.engine else { return }
-            rounds_engine_send(engine, command, -1)
+            rounds_engine_send(engine, self.selected, command, -1)
         }
     }
 
@@ -63,12 +82,15 @@ final class ControlRouter: @unchecked Sendable {
         guard raw != Int32(ROUNDS_GESTURE_NONE.rawValue) else { return }
         let gesture = RoundsGesture(rawValue: UInt32(raw))
         let command = rounds_gesture_command(raw)
+        // Double-tap and hold revert their tap first, so they go to the tap's loop
+        // even if another pad was selected in between.
+        if gesture == ROUNDS_GESTURE_TAP { gestureLoop = selected }
         if command >= 0, let engine {
             if gesture == ROUNDS_GESTURE_TAP || gesture == ROUNDS_GESTURE_DOUBLE_TAP {
                 // Presses are scheduled at the moment the pedal moved.
-                rounds_engine_send_at_host_time(engine, RoundsCommand(rawValue: UInt32(command)), hostTime)
+                rounds_engine_send_at_host_time(engine, gestureLoop, RoundsCommand(rawValue: UInt32(command)), hostTime)
             } else {
-                rounds_engine_send(engine, RoundsCommand(rawValue: UInt32(command)), -1)
+                rounds_engine_send(engine, gestureLoop, RoundsCommand(rawValue: UInt32(command)), -1)
             }
         }
         DispatchQueue.main.async { self.onGesture?(gesture) }
