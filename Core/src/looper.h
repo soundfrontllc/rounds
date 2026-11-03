@@ -28,14 +28,16 @@ public:
         int maxUndoLayers = 8;         // older layers are merged into the base
         int flattenSamplesPerBlock = 16384;
         int64_t minLoopSamples = 4800;
+        int historySamples = 24000;    // recent input kept so a recording can start slightly in the past
     };
 
     explicit Looper(const Config& config);
 
     void setLatency(int inputLatency, int outputLatency);
-    // Length that closed loops snap to (1/8x ... 8x of it). 0 = this loop sets
-    // the base: its length is only rounded to a multiple of 8 samples.
-    void setBaseLength(int64_t baseLength) { baseLength_ = baseLength; }
+    // Closed loops snap to a power-of-two number of bars (1, 2, 4, 8 ...).
+    // 0 = no tempo yet: this loop sets it, and its length is only rounded to a
+    // multiple of 8 samples.
+    void setBarLength(int64_t barLength) { barLength_ = barLength; }
     // Moves the loop's phase; used to restart all loops together from the top.
     void shiftOrigin(int64_t delta) { origin_ += delta; }
     int64_t origin() const { return origin_; }
@@ -44,6 +46,13 @@ public:
 
     // Commands take effect at the current clock (between samples).
     void tap();
+    // Like tap(), but a recording started from Empty begins at real time
+    // `recordFrom` (at most historySamples in the past) instead of now.
+    void tapRecordingFrom(int64_t recordFrom);
+    // The engine queued this tap for the next bar: a double-tap or hold must not
+    // revert the tap before it.
+    void forgetTap() { lastTap_ = TapEffect::None; }
+    void revertTap() { revertLastTap(); }
     void undo();
     void undoRevertingTap();   // double-tap: revert the last tap's effect, then undo
     void stop();
@@ -84,7 +93,7 @@ private:
         bool writing = true;      // false once the punch-out tail is done
     };
 
-    void startRecording();
+    void startRecording(int64_t from);
     bool finishRecording();    // false if the loop would be too short
     int64_t snapLength(int64_t recorded, int64_t minimum) const;
     int openLayer();
@@ -115,7 +124,8 @@ private:
     bool baseWriting_ = false;
     int64_t loopLength_ = 0;
     int64_t origin_ = 0;      // real time at which loop index 0 is heard (mod length)
-    int64_t baseLength_ = 0;
+    int64_t barLength_ = 0;
+    std::vector<float> history_;  // input by real time, modulo its size
 
     std::vector<Layer> layers_;
     std::vector<int> order_;  // slots of layers in the stack, oldest first

@@ -19,6 +19,7 @@ Looper::Looper(const Config& config) : config_(config) {
     layers_.resize(static_cast<size_t>(config_.maxUndoLayers + 2));
     for (auto& layer : layers_) layer.buffer.assign(static_cast<size_t>(config_.maxLoopSamples), 0.0f);
     order_.reserve(layers_.size());
+    history_.assign(static_cast<size_t>(std::max(1, config_.historySamples)), 0.0f);
 }
 
 void Looper::setLatency(int inputLatency, int outputLatency) {
@@ -45,10 +46,12 @@ int Looper::closedLayers() const {
 // ---------------------------------------------------------------------------
 // Commands
 
-void Looper::tap() {
+void Looper::tap() { tapRecordingFrom(clock_); }
+
+void Looper::tapRecordingFrom(int64_t recordFrom) {
     switch (state_) {
         case State::Empty:
-            startRecording();
+            startRecording(std::min(recordFrom, clock_));
             lastTap_ = TapEffect::StartedRecording;
             break;
         case State::Recording:
@@ -159,13 +162,20 @@ void Looper::clear() {
 // ---------------------------------------------------------------------------
 // Recording and layers
 
-void Looper::startRecording() {
+void Looper::startRecording(int64_t from) {
     clear();
     state_ = State::Recording;
-    baseStartS_ = clock_;
+    baseStartS_ = from;
     baseWritten_ = 0;
     baseWriting_ = true;
-    origin_ = clock_;
+    origin_ = from;
+    // Input up to real time `heard` has already gone by; copy what was played
+    // since `from` out of the history (silence for anything older than it holds).
+    const int64_t heard = clock_ - inputLatency_;
+    const int64_t size = static_cast<int64_t>(history_.size());
+    for (int64_t s = from; s < heard; s++) {
+        base_[static_cast<size_t>(baseWritten_++)] = s >= heard - size ? history_[static_cast<size_t>(wrap(s, size))] : 0.0f;
+    }
 }
 
 bool Looper::finishRecording() {
@@ -182,15 +192,10 @@ bool Looper::finishRecording() {
 // If the snapped length is longer than what was played, recording carries on
 // to the new end (writeInput) and readLoop plays silence until it gets there.
 int64_t Looper::snapLength(int64_t recorded, int64_t minimum) const {
-    if (baseLength_ <= 0) return recorded - recorded % 8;
+    if (barLength_ <= 0) return recorded - recorded % 8;
     int64_t best = -1;
-    for (int64_t d = 8; d >= 1; d /= 2) {
-        const int64_t candidate = baseLength_ / d;
+    for (int64_t candidate = barLength_; candidate <= config_.maxLoopSamples; candidate *= 2) {
         if (candidate < minimum) continue;
-        if (best < 0 || std::llabs(recorded - candidate) < std::llabs(recorded - best)) best = candidate;
-    }
-    for (int64_t m = 2; m <= 8 && baseLength_ * m <= config_.maxLoopSamples; m *= 2) {
-        const int64_t candidate = baseLength_ * m;
         if (best < 0 || std::llabs(recorded - candidate) < std::llabs(recorded - best)) best = candidate;
     }
     return best > 0 ? best : recorded;
@@ -280,6 +285,7 @@ void Looper::finishLoad(int64_t length, int64_t origin) {
 
 void Looper::writeInput(float sample, int64_t s) {
     const int fade = config_.crossfadeSamples;
+    history_[static_cast<size_t>(wrap(s, static_cast<int64_t>(history_.size())))] = sample;
 
     if (baseWriting_ && s >= baseStartS_) {
         const int64_t end = loopLength_ > 0 ? loopLength_ + fade : config_.maxLoopSamples + fade;

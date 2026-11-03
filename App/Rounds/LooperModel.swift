@@ -40,6 +40,13 @@ struct LoopInfo: Identifiable, Equatable {
     var layers = 0
     var level: Float = 0
     var gain: Float = 1
+    var bars = 0                     // length in bars, 0 until there is a tempo
+    var queued = Queued.none
+
+    /// An action waiting for the next bar.
+    enum Queued: Int32 {
+        case none, tap, stop
+    }
 }
 
 /// UI-side state. Polls the engine; never touches the audio thread directly.
@@ -76,9 +83,27 @@ final class LooperModel: ObservableObject {
         }
     }
     @Published var loops: [LoopInfo] = (0..<Int(ROUNDS_MAX_LOOPS)).map { LoopInfo(id: $0) }
-    /// Length later loops snap to, set by the first loop recorded.
+    /// The first loop recorded sets the tempo.
     @Published var baseSeconds: Double = 0
     @Published var baseLoop = -1
+    @Published var bars = 0              // bars in the base loop, 0 = no tempo yet
+    @Published var bpm: Double = 0
+    @Published var cycleBars = 0
+    @Published var positionText = "—"    // bar.beat.sixteenth in the cycle
+    @Published var running = false
+    @Published var quantize = UserDefaults.standard.object(forKey: "quantize") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(quantize, forKey: "quantize")
+            applyTransportSettings()
+        }
+    }
+    @Published var click = UserDefaults.standard.object(forKey: "click") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(click, forKey: "click")
+            applyTransportSettings()
+        }
+    }
+    private var barLength: Int64 = 0
     /// Kept here so volumes survive restarting the audio device.
     private var gains = [Float](repeating: 1, count: Int(ROUNDS_MAX_LOOPS))
     /// The Launchkey can't report where its knobs are, so the last value each
@@ -236,6 +261,7 @@ final class LooperModel: ObservableObject {
         audio = io
         engine = rounds_audio_engine(io)
         applyMonitor()
+        applyTransportSettings()
         for loop in gains.indices { applyGain(loop, gains[loop]) }
         router.setEngine(engine)
         router.select(loop: selectedLoop)
@@ -271,6 +297,23 @@ final class LooperModel: ObservableObject {
         append("Audio", "Measuring latency: playing 8 clicks. The output must be cabled back into the input.")
     }
 
+    private static let clickGain: Float = 0.35
+
+    private func applyTransportSettings() {
+        guard let engine else { return }
+        rounds_engine_set_quantize(engine, quantize ? 1 : 0)
+        rounds_engine_set_click_gain(engine, click ? Self.clickGain : 0)
+    }
+
+    /// Takes the first loop as twice / half as many bars: doubles or halves the tempo.
+    func doubleTempo() { setBars(bars * 2) }
+    func halveTempo() { setBars(bars / 2) }
+
+    func setBars(_ newBars: Int) {
+        guard let engine, newBars >= 1, newBars <= 8 else { return }
+        rounds_engine_set_bars(engine, Int32(newBars))
+    }
+
     private func applyMonitor() {
         guard let engine else { return }
         rounds_engine_set_monitor_gain(engine, monitorInput ? 1.0 : 0.0)
@@ -292,6 +335,7 @@ final class LooperModel: ObservableObject {
     // MARK: Controls
 
     func tap() { router.send(ROUNDS_CMD_TAP) }
+    func startStopAll() { router.startStopAll(hostTime: 0) }
     func undo() { router.send(ROUNDS_CMD_UNDO) }
     func stop() { router.send(ROUNDS_CMD_STOP) }
     func clear() { router.send(ROUNDS_CMD_CLEAR) }
@@ -327,7 +371,7 @@ final class LooperModel: ObservableObject {
         applyGain(knob, Self.knobGain(value))
     }
 
-    private var lastLEDState: [LoopState]?
+    private var lastLEDState: [String]?
     private var lastLEDSelected = -1
 
     private func launchkey(_ control: Launchkey.Control) {
@@ -348,13 +392,32 @@ final class LooperModel: ObservableObject {
     }
 
     private func updateLaunchkeyLEDs(force: Bool = false) {
-        let states = loops.map(\.state)
-        guard force || states != lastLEDState || selectedLoop != lastLEDSelected else { return }
-        lastLEDState = states
+        let key = loops.map { "\($0.state)/\($0.queued)" }
+        guard force || key != lastLEDState || selectedLoop != lastLEDSelected else { return }
+        lastLEDState = key
         lastLEDSelected = selectedLoop
         var messages: [[UInt8]] = []
-        for (pad, loopState) in states.enumerated() {
+        for loop in loops {
+            let pad = loop.id
+            let loopState = loop.state
             let color = Self.slotColors[pad]
+            // Blinking = waiting for the next bar.
+            switch (loop.queued, loopState) {
+            case (.tap, .empty):
+                messages.append(Launchkey.loopPadLED(pad, color: Launchkey.Color.off))
+                messages.append(Launchkey.loopPadLED(pad, color: Launchkey.Color.red, mode: .flashing))
+                continue
+            case (.tap, _):
+                messages.append(Launchkey.loopPadLED(pad, color: Launchkey.Color.dimWhite))
+                messages.append(Launchkey.loopPadLED(pad, color: color, mode: .flashing))
+                continue
+            case (.stop, _):
+                messages.append(Launchkey.loopPadLED(pad, color: color))
+                messages.append(Launchkey.loopPadLED(pad, color: Launchkey.Color.off, mode: .flashing))
+                continue
+            case (.none, _):
+                break
+            }
             switch loopState {
             case .empty:
                 messages.append(Launchkey.loopPadLED(pad, color: Launchkey.Color.off))
@@ -388,6 +451,16 @@ final class LooperModel: ObservableObject {
         sampleRate = s.sampleRate
         baseSeconds = Double(s.baseLength) / s.sampleRate
         baseLoop = Int(s.baseLoop)
+        if Int(s.bars) != bars, s.bars > 0 {
+            append("Tempo", String(format: "%.1f BPM: loop %d is %d bar%@", 240 * s.sampleRate / Double(s.barLength),
+                                   s.baseLoop + 1, s.bars, s.bars == 1 ? "" : "s"))
+        }
+        bars = Int(s.bars)
+        barLength = s.barLength
+        bpm = s.barLength > 0 ? 240 * s.sampleRate / Double(s.barLength) : 0
+        cycleBars = s.barLength > 0 ? Int(s.cycleLength / s.barLength) : 0
+        running = s.running != 0
+        positionText = Self.position(s.cyclePosition, barLength: s.barLength)
         var updated = loops
         for i in updated.indices {
             var l = RoundsLoopStatus()
@@ -399,6 +472,8 @@ final class LooperModel: ObservableObject {
             updated[i].layers = Int(l.layers)
             updated[i].level = max(l.peak, updated[i].level * 0.8)
             updated[i].gain = l.gain
+            updated[i].bars = s.barLength > 0 ? Int(l.loopLength / s.barLength) : 0
+            updated[i].queued = LoopInfo.Queued(rawValue: l.queued) ?? .none
         }
         if updated != loops { loops = updated }
         let selected = loops[selectedLoop]
@@ -426,10 +501,17 @@ final class LooperModel: ObservableObject {
             append("Loop \(event.loop + 1)", "→ \(LoopState(rawValue: Int32(event.value))?.label ?? "?")")
         case ROUNDS_EVENT_LOOP_LENGTH.rawValue where event.value > 0:
             var text = String(format: "Length %.3f s (%lld samples)", Double(event.value) / sampleRate, event.value)
-            if baseLoop >= 0 && baseLoop != Int(event.loop) && baseSeconds > 0 {
-                text += String(format: ", %@ of the base", ratioText(Double(event.value) / sampleRate / baseSeconds))
+            if barLength > 0 && Int(event.loop) != baseLoop {
+                text += ", " + Self.barsText(Int(event.value / barLength))
             }
             append("Loop \(event.loop + 1)", text)
+        case ROUNDS_EVENT_QUEUED.rawValue:
+            let state = loops[Int(event.loop)].state
+            switch LoopInfo.Queued(rawValue: Int32(event.value)) ?? .none {
+            case .tap: append("Loop \(event.loop + 1)", state == .empty ? "Records at the next bar" : "Plays at the next bar")
+            case .stop: append("Loop \(event.loop + 1)", "Stops at the next bar")
+            case .none: break
+            }
         case ROUNDS_EVENT_LAYER_COUNT.rawValue:
             append("Loop \(event.loop + 1)", "Layers: \(event.value)")
         case ROUNDS_EVENT_CALIBRATION_DONE.rawValue:
@@ -446,8 +528,13 @@ final class LooperModel: ObservableObject {
         }
     }
 
-    func ratioText(_ ratio: Double) -> String {
-        ratio >= 1 ? String(format: "%.0f×", ratio) : "1/\(Int((1 / ratio).rounded()))×"
+    static func barsText(_ bars: Int) -> String { "\(bars) bar\(bars == 1 ? "" : "s")" }
+
+    /// bar.beat.sixteenth (from 1), 4/4.
+    static func position(_ samples: Int64, barLength: Int64) -> String {
+        guard barLength > 0 else { return "—" }
+        let sixteenths = Int(samples * 16 / barLength)
+        return "\(sixteenths / 16 + 1).\(sixteenths / 4 % 4 + 1).\(sixteenths % 4 + 1)"
     }
 
     private func logGesture(_ gesture: RoundsGesture) {

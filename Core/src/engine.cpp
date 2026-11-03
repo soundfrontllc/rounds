@@ -22,7 +22,21 @@ void storeMax(std::atomic<float>& target, float value) {
 }
 
 bool validLoop(int loop) { return loop >= 0 && loop < Engine::kLoops; }
+
+int64_t wrap(int64_t value, int64_t length) {
+    const int64_t r = value % length;
+    return r < 0 ? r + length : r;
+}
 }  // namespace
+
+int Engine::chooseBars(int64_t baseLength, double sampleRate) {
+    // Beats per minute if the loop is `bars` bars of 4/4.
+    for (int bars = 1; bars <= 8; bars *= 2) {
+        const double bpm = 4.0 * bars * 60.0 * sampleRate / static_cast<double>(baseLength);
+        if (bpm >= 80.0 || bars == 8) return bars;
+    }
+    return 8;
+}
 
 Engine::Engine(double sampleRate, double maxLoopSeconds, int maxBlockFrames)
     : sampleRate_(sampleRate), maxBlock_(maxBlockFrames), probe_(sampleRate) {
@@ -39,7 +53,7 @@ Engine::Engine(double sampleRate, double maxLoopSeconds, int maxBlockFrames)
 // Non-real-time side
 
 bool Engine::send(int loop, RoundsCommand cmd, int64_t sampleTime) {
-    if (!validLoop(loop)) return false;
+    if (!validLoop(loop) && !(cmd == ROUNDS_CMD_START_STOP_ALL && loop == -1)) return false;
     std::lock_guard<std::mutex> lock(producerMutex_);
     return commands_.push(Command{loop, cmd, sampleTime});
 }
@@ -78,6 +92,11 @@ void Engine::setLoopGain(int loop, float gain) {
 void Engine::getStatus(RoundsStatus* out) {
     out->baseLength = statBase_.load();
     out->baseLoop = statBaseLoop_.load();
+    out->bars = statBars_.load();
+    out->barLength = statBarLength_.load();
+    out->cycleLength = statCycle_.load();
+    out->cyclePosition = statCyclePosition_.load();
+    out->running = statRunning_.load();
     out->inputPeak = statInputPeak_.exchange(0.0f);
     out->outputPeak = statOutputPeak_.exchange(0.0f);
     out->inputLatency = inputLatency_.load();
@@ -99,6 +118,7 @@ void Engine::getLoopStatus(int loop, RoundsLoopStatus* out) {
     out->layerOpen = s.layerOpen.load();
     out->peak = s.peak.exchange(0.0f);
     out->gain = loopGain_[static_cast<size_t>(loop)].load();
+    out->queued = s.queued.load();
 }
 
 // ---------------------------------------------------------------------------
@@ -161,32 +181,171 @@ bool Engine::importing(int loop) const {
     return (state == kImportRequested || state == kImporting) && loop == transferLoop_;
 }
 
+bool Engine::running() const {
+    for (const auto& looper : loops_) {
+        if (looper->state() != Looper::State::Empty && looper->state() != Looper::State::Stopped) return true;
+    }
+    return false;
+}
+
+bool Engine::quantizing() const {
+    return barLength_ > 0 && quantize_.load(std::memory_order_relaxed) && running();
+}
+
+// Moves every loop's phase, and the bar grid with them.
+void Engine::shiftAll(int64_t delta) {
+    for (auto& looper : loops_) looper->shiftOrigin(delta);
+    gridOrigin_ += delta;
+}
+
+bool Engine::cancelScheduled(int loop) {
+    Scheduled& s = scheduled_[static_cast<size_t>(loop)];
+    if (s.action == kNone) return false;
+    s.action = kNone;
+    return true;
+}
+
 void Engine::apply(int loop, int32_t cmd) {
-    if (importing(loop)) return;  // the loop is being loaded from a session
-    Looper& looper = *loops_[static_cast<size_t>(loop)];
-    looper.setBaseLength(baseLength_);
-    switch (cmd) {
-        case ROUNDS_CMD_TAP:
-            if (looper.state() == Looper::State::Stopped && !anyAudible()) {
-                // Nothing playing: start this loop from the top, and move every
-                // loop's phase with it so they stay in step with each other.
-                const int64_t delta = looper.clock() - looper.origin();
-                for (auto& other : loops_) other->shiftOrigin(delta);
-            }
-            looper.tap();
-            break;
-        case ROUNDS_CMD_UNDO: looper.undo(); break;
-        case ROUNDS_CMD_STOP: looper.stop(); break;
-        case ROUNDS_CMD_CLEAR: looper.clear(); break;
-        case ROUNDS_CMD_UNDO_REVERTING_TAP: looper.undoRevertingTap(); break;
-        case ROUNDS_CMD_STOP_REVERTING_TAP: looper.stopRevertingTap(); break;
-        default: break;
+    if (cmd == ROUNDS_CMD_START_STOP_ALL) {
+        startStopAll();
+    } else {
+        if (importing(loop)) return;  // the loop is being loaded from a session
+        Looper& looper = *loops_[static_cast<size_t>(loop)];
+        switch (cmd) {
+            case ROUNDS_CMD_TAP: tap(loop); break;
+            case ROUNDS_CMD_UNDO:
+                // Undo takes back a queued action first.
+                if (!cancelScheduled(loop)) looper.undo();
+                break;
+            case ROUNDS_CMD_STOP:
+                if (scheduled_[static_cast<size_t>(loop)].action == kQueuedTap) {
+                    cancelScheduled(loop);  // stopping a queued record/play just cancels it
+                } else {
+                    stop(loop);
+                }
+                break;
+            case ROUNDS_CMD_CLEAR:
+                cancelScheduled(loop);
+                looper.clear();
+                break;
+            case ROUNDS_CMD_UNDO_REVERTING_TAP:
+                // A queued tap never happened, so there is nothing to revert.
+                if (scheduled_[static_cast<size_t>(loop)].action == kQueuedTap) cancelScheduled(loop);
+                looper.undoRevertingTap();
+                break;
+            case ROUNDS_CMD_STOP_REVERTING_TAP:
+                if (scheduled_[static_cast<size_t>(loop)].action == kQueuedTap) {
+                    cancelScheduled(loop);
+                } else {
+                    looper.revertTap();
+                }
+                stop(loop);
+                break;
+            default: break;
+        }
     }
     updateBase();
     publish();
 }
 
-// The first loop to get a length sets the base; it resets once every loop is empty.
+void Engine::tap(int loop) {
+    Looper& looper = *loops_[static_cast<size_t>(loop)];
+    looper.setBarLength(barLength_);
+    if (cancelScheduled(loop)) {
+        looper.forgetTap();  // a second tap takes back a queued record, play or stop
+        return;
+    }
+    const Looper::State state = looper.state();
+    const bool starts = state == Looper::State::Empty || state == Looper::State::Stopped;
+    if (!starts || barLength_ <= 0) {
+        looper.tap();
+        return;
+    }
+    const int64_t now = clock();
+    if (!running()) {
+        // Nothing playing: start now, and move the bar grid (and every loop's
+        // phase with it) so this is the top of a bar, or of this loop.
+        shiftAll(state == Looper::State::Stopped ? now - looper.origin() : wrap(now - gridOrigin_, barLength_));
+        looper.tap();
+        return;
+    }
+    if (!quantize_.load(std::memory_order_relaxed)) {
+        looper.tap();
+        return;
+    }
+    // A tap just after a bar line counts for that bar (players tend to land a
+    // little late); otherwise it waits for the next one.
+    const int64_t since = wrap(now - gridOrigin_, barLength_);
+    const int64_t late = std::min<int64_t>(barLength_ / 8, static_cast<int64_t>(sampleRate_ / 4));
+    if (since <= late) {
+        looper.tapRecordingFrom(now - since);
+    } else {
+        scheduled_[static_cast<size_t>(loop)] = Scheduled{kQueuedTap, now + barLength_ - since};
+        looper.forgetTap();
+    }
+}
+
+void Engine::stop(int loop) {
+    Looper& looper = *loops_[static_cast<size_t>(loop)];
+    cancelScheduled(loop);
+    const Looper::State state = looper.state();
+    const bool audible = state == Looper::State::Playing || state == Looper::State::Overdubbing;
+    if (!audible || !quantizing()) {
+        looper.stop();
+        return;
+    }
+    const int64_t now = clock();
+    const int64_t since = wrap(now - gridOrigin_, barLength_);
+    const int64_t late = std::min<int64_t>(barLength_ / 8, static_cast<int64_t>(sampleRate_ / 4));
+    if (since <= late) {
+        looper.stop();
+    } else {
+        scheduled_[static_cast<size_t>(loop)] = Scheduled{kQueuedStop, now + barLength_ - since};
+    }
+}
+
+// Play button: stop everything (on the next bar), or start every stopped loop
+// together from the top of the longest one.
+void Engine::startStopAll() {
+    if (running()) {
+        for (int i = 0; i < kLoops; i++) {
+            const Looper::State state = loops_[static_cast<size_t>(i)]->state();
+            if (state == Looper::State::Empty || state == Looper::State::Stopped) {
+                cancelScheduled(i);
+            } else {
+                stop(i);
+            }
+        }
+        return;
+    }
+    int longest = -1;
+    for (int i = 0; i < kLoops; i++) {
+        cancelScheduled(i);
+        const Looper& looper = *loops_[static_cast<size_t>(i)];
+        if (looper.state() == Looper::State::Stopped &&
+            (longest < 0 || looper.loopLength() > loops_[static_cast<size_t>(longest)]->loopLength())) {
+            longest = i;
+        }
+    }
+    if (longest < 0) return;
+    shiftAll(clock() - loops_[static_cast<size_t>(longest)]->origin());
+    for (auto& looper : loops_) {
+        if (looper->state() == Looper::State::Stopped) looper->tap();
+    }
+}
+
+void Engine::fireScheduled(int loop) {
+    Scheduled& s = scheduled_[static_cast<size_t>(loop)];
+    Looper& looper = *loops_[static_cast<size_t>(loop)];
+    looper.setBarLength(barLength_);
+    if (s.action == kQueuedTap) looper.tap();
+    if (s.action == kQueuedStop) looper.stop();
+    s.action = kNone;
+    updateBase();
+    publish();
+}
+
+// The first loop to get a length sets the tempo; it resets once every loop is empty.
 void Engine::updateBase() {
     bool anyLoop = false;
     for (int i = 0; i < kLoops; i++) {
@@ -195,12 +354,24 @@ void Engine::updateBase() {
         if (baseLength_ == 0 && looper.loopLength() > 0) {
             baseLength_ = looper.loopLength();
             baseLoop_ = i;
+            gridOrigin_ = looper.origin();
+            applyBars(chooseBars(baseLength_, sampleRate_));
         }
     }
-    if (!anyLoop) {
+    if (!anyLoop && baseLength_ != 0) {
         baseLength_ = 0;
         baseLoop_ = -1;
+        bars_ = 0;
+        barLength_ = 0;
+        for (auto& looper : loops_) looper->setBarLength(0);
     }
+}
+
+void Engine::applyBars(int bars) {
+    if (baseLength_ <= 0 || bars < 1 || bars > 8 || (bars & (bars - 1)) != 0 || baseLength_ % bars != 0) return;
+    bars_ = bars;
+    barLength_ = baseLength_ / bars;
+    for (auto& looper : loops_) looper->setBarLength(barLength_);
 }
 
 void Engine::publish() {
@@ -221,6 +392,11 @@ void Engine::publish() {
         if (looper.closedLayers() != last.layers) {
             last.layers = looper.closedLayers();
             emit(ROUNDS_EVENT_LAYER_COUNT, i, last.layers);
+        }
+        const int queued = scheduled_[static_cast<size_t>(i)].action;
+        if (queued != last.queued) {
+            last.queued = queued;
+            emit(ROUNDS_EVENT_QUEUED, i, queued);
         }
     }
 }
@@ -276,7 +452,38 @@ void Engine::stepTransfer() {
     }
 }
 
-void Engine::processChunk(const float* input, float* out, int frames) {
+// A short blip on every beat while anything plays, higher on the downbeat.
+// Timed by what is heard: a beat leaves outputLatency early so it sounds on
+// the grid, like the loops do.
+void Engine::renderClick(float* out, int frames, int64_t start) {
+    const float gain = clickGain_.load(std::memory_order_relaxed);
+    if (barLength_ <= 0) return;
+    const bool on = gain > 0.0f && running();
+    const int64_t latency = outputLatency_.load(std::memory_order_relaxed);
+    for (int i = 0; i < frames; i++) {
+        if (on) {
+            const int64_t inBar = wrap(start + i + latency - gridOrigin_, barLength_);
+            for (int beat = 0; beat < 4; beat++) {
+                if (inBar != barLength_ * beat / 4) continue;
+                const float freq = beat == 0 ? 1760.0f : 1320.0f;
+                clickStep_ = freq / static_cast<float>(sampleRate_);
+                clickPhase_ = 0.0f;
+                clickLevel_ = beat == 0 ? 1.0f : 0.6f;
+                clickDecay_ = std::exp(std::log(0.001f) / static_cast<float>(sampleRate_ * 0.03));
+            }
+        }
+        if (clickLevel_ < 1e-4f) {
+            clickLevel_ = 0.0f;
+            continue;
+        }
+        out[i] += std::sin(6.2831853f * clickPhase_) * clickLevel_ * gain;
+        clickPhase_ += clickStep_;
+        if (clickPhase_ >= 1.0f) clickPhase_ -= 1.0f;
+        clickLevel_ *= clickDecay_;
+    }
+}
+
+void Engine::processChunk(const float* input, float* out, int frames, int64_t start) {
     if (frames <= 0) return;
     if (probe_.active()) {
         // While calibrating the loopers hear silence and stay quiet.
@@ -308,6 +515,7 @@ void Engine::processChunk(const float* input, float* out, int frames) {
         }
         chunkPeak_[static_cast<size_t>(l)] = peak;
     }
+    renderClick(out, frames, start);
     const float monitor = monitorGain_.load(std::memory_order_relaxed);
     if (monitor > 0.0f) {
         for (int i = 0; i < frames; i++) out[i] += input[i] * monitor;
@@ -340,6 +548,8 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
     if (calibrateRequested_.exchange(false, std::memory_order_relaxed) && !probe_.active()) {
         probe_.start();
     }
+    const int bars = requestedBars_.exchange(0, std::memory_order_relaxed);
+    if (bars > 0) applyBars(bars);
 
     // Move queued commands into the time-ordered pending list.
     Command incoming;
@@ -356,19 +566,28 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
     std::memset(outL, 0, sizeof(float) * static_cast<size_t>(frames));
     chunkPeak_.fill(0.0f);
 
-    // Render in chunks split exactly at command times.
+    // Render in chunks split exactly at command times and queued bar lines.
     int pos = 0;
     while (pos < frames) {
-        while (pendingCount_ > 0 && pending_[0].time <= now_ + pos) {
+        const int64_t at = now_ + pos;
+        while (pendingCount_ > 0 && pending_[0].time <= at) {
             const Command command = pending_[0];
             for (int i = 1; i < pendingCount_; i++) pending_[i - 1] = pending_[i];
             pendingCount_--;
             apply(command.loop, command.cmd);
         }
-        int chunk = frames - pos;
-        if (pendingCount_ > 0) chunk = static_cast<int>(std::min<int64_t>(chunk, pending_[0].time - (now_ + pos)));
-        processChunk(input + pos, outL + pos, chunk);
-        pos += chunk;
+        for (int l = 0; l < kLoops; l++) {
+            if (scheduled_[static_cast<size_t>(l)].action != kNone && scheduled_[static_cast<size_t>(l)].time <= at) {
+                fireScheduled(l);
+            }
+        }
+        int64_t chunk = frames - pos;
+        if (pendingCount_ > 0) chunk = std::min<int64_t>(chunk, pending_[0].time - at);
+        for (const Scheduled& s : scheduled_) {
+            if (s.action != kNone) chunk = std::min<int64_t>(chunk, s.time - at);
+        }
+        processChunk(input + pos, outL + pos, static_cast<int>(chunk), at);
+        pos += static_cast<int>(chunk);
     }
 
     float inPeak = 0.0f;
@@ -395,7 +614,15 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
         s.position.store(looper.heardPosition(), std::memory_order_relaxed);
         s.layers.store(looper.closedLayers(), std::memory_order_relaxed);
         s.layerOpen.store(looper.layerOpen() ? 1 : 0, std::memory_order_relaxed);
+        s.queued.store(scheduled_[static_cast<size_t>(l)].action, std::memory_order_relaxed);
     }
+    int64_t cycle = 0;
+    for (const auto& looper : loops_) cycle = std::max(cycle, looper->loopLength());
+    statBars_.store(bars_, std::memory_order_relaxed);
+    statBarLength_.store(barLength_, std::memory_order_relaxed);
+    statCycle_.store(cycle, std::memory_order_relaxed);
+    statCyclePosition_.store(cycle > 0 ? wrap(now_ + out - gridOrigin_, cycle) : 0, std::memory_order_relaxed);
+    statRunning_.store(running() ? 1 : 0, std::memory_order_relaxed);
     statBase_.store(baseLength_, std::memory_order_relaxed);
     statBaseLoop_.store(baseLoop_, std::memory_order_relaxed);
     statCalibrating_.store(probe_.active() ? 1 : 0, std::memory_order_relaxed);

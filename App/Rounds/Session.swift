@@ -17,6 +17,7 @@ struct SessionManifest: Codable {
     var format = 1
     var sampleRate: Double
     var baseLoop: Int
+    var bars: Int?             // bars in the base loop (tempo); nil = guessed again on load
     var selectedLoop: Int
     var loops: [Loop]
 
@@ -207,7 +208,8 @@ extension LooperModel {
         append("Session", "Saving \(name)…")
 
         let capacity = rounds_engine_max_loop_samples(engine)
-        var manifest = SessionManifest(sampleRate: sampleRate, baseLoop: baseLoop, selectedLoop: selectedLoop, loops: [])
+        var manifest = SessionManifest(sampleRate: sampleRate, baseLoop: baseLoop, bars: bars > 0 ? bars : nil,
+                                       selectedLoop: selectedLoop, loops: [])
         var audio: [Int: [Float]] = [:]
         for loop in loops {
             var entry = SessionManifest.Loop(slot: loop.id, gain: loop.gain)
@@ -234,8 +236,9 @@ extension LooperModel {
             entry.samples = length
         }
         if manifest.baseLoop >= 0 && audio[manifest.baseLoop] == nil {
-            // The base wasn't saved: the first saved loop sets it on load.
+            // The base wasn't saved: the first saved loop sets the tempo on load.
             manifest.baseLoop = audio.keys.min() ?? -1
+            manifest.bars = nil
         }
 
         let toWrite = manifest
@@ -295,6 +298,7 @@ extension LooperModel {
         for loop in manifest.loops where loop.slot >= 0 && loop.slot < Int(ROUNDS_MAX_LOOPS) {
             setGain(loop.slot, loop.gain)
         }
+        if let savedBars = manifest.bars { setBars(savedBars) }
         if manifest.selectedLoop >= 0 && manifest.selectedLoop < Int(ROUNDS_MAX_LOOPS) { selectedLoop = manifest.selectedLoop }
         sessionURL = url
         sessionMessage = nil

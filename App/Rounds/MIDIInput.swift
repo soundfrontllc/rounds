@@ -96,6 +96,7 @@ final class MIDIInput: @unchecked Sendable {
             if fromDAWPort, let control = Launchkey.parse(event.midi1RawBytes()) {
                 // Record is the footswitch's tap; keep the MIDI timestamp for timing.
                 if control == .record(down: true) { router.tap(hostTime: timeStamp) }
+                if control == .play(down: true) { router.startStopAll(hostTime: timeStamp) }
                 // A held pad streams pressure every ~10 ms; it would bury the log.
                 if control == .padPressure { continue }
                 DispatchQueue.main.async { [weak self] in

@@ -422,28 +422,30 @@ static void testManyLayersMerge() {
 // ---------------------------------------------------------------------------
 // Several loops on one clock
 
-static void testLoopsSnapToBase() {
-    std::printf("Loops: later loops snap to 1/8x ... 8x of the first\n");
-    const int64_t base = 48000;
+static void testLoopsSnapToBars() {
+    std::printf("Loops: later loops snap to 1, 2, 4, 8 ... bars of the first loop's tempo\n");
+    const int64_t base = 192000;  // 4 s: 2 bars at 120 BPM
+    const int64_t bar = base / 2;
     struct Case { int loop; double played; int64_t expected; };
-    const Case cases[] = {{1, 1.9, 2 * base}, {2, 0.55, base / 2}, {3, 1.2, base}, {4, 3.1, 4 * base},
-                          {5, 0.3, base / 4}, {6, 6.2, 8 * base}};
+    const Case cases[] = {{1, 1.9, 2 * base}, {2, 0.55, bar}, {3, 1.2, base}, {4, 0.3, bar}, {5, 0.8, base}};
     Driver d;
     d.engine.send(0, ROUNDS_CMD_TAP, -1);
     d.advance(base);
     d.send(ROUNDS_CMD_TAP);
     CHECK(status(d.engine).baseLength == base && status(d.engine).baseLoop == 0, "base %lld from loop %d",
           (long long)status(d.engine).baseLength, status(d.engine).baseLoop);
+    CHECK(status(d.engine).bars == 2 && status(d.engine).barLength == bar, "taken as %d bars of %lld",
+          status(d.engine).bars, (long long)status(d.engine).barLength);
     for (const Case& k : cases) {
         d.send(ROUNDS_CMD_TAP, k.loop);
         d.advance(static_cast<int64_t>(base * k.played) - 128);
         d.send(ROUNDS_CMD_TAP, k.loop);
-        std::printf("  played %.2fx -> %.3fx\n", k.played, double(d.s(k.loop).loopLength) / double(base));
+        std::printf("  played %.2fx the first loop -> %lld bars\n", k.played, (long long)(d.s(k.loop).loopLength / bar));
         CHECK(d.s(k.loop).loopLength == k.expected, "loop %d length %lld, expected %lld", k.loop + 1,
               (long long)d.s(k.loop).loopLength, (long long)k.expected);
     }
     for (int loop = 0; loop < 7; loop++) d.send(ROUNDS_CMD_CLEAR, loop);
-    CHECK(status(d.engine).baseLength == 0, "base resets when every loop is empty");
+    CHECK(status(d.engine).baseLength == 0 && status(d.engine).bars == 0, "tempo resets when every loop is empty");
 }
 
 // Three loops of 1x, 2x and 1/2x, recorded one after another at arbitrary
@@ -452,7 +454,7 @@ static void testLoopsSnapToBase() {
 // (it snapped longer, so recording carried on to the snapped end).
 static void testLoopsStayInStep() {
     std::printf("Timing: loops of 1x, 2x and 1/2x stay in step for 10 minutes\n");
-    const int64_t L = 96000;
+    const int64_t L = 192000;  // 2 bars, so 1/2x is one bar
     const int64_t s = 1000;
     const int64_t total = static_cast<int64_t>(kRate * 600);
     Sim sim(200, 300, 128, total);
@@ -487,7 +489,7 @@ static void testLoopsStayInStep() {
                     (long long)r.worstError, (long long)(r.lastError - r.firstError));
         CHECK(r.worstError == 0 && r.missing == 0, "%s: error %lld missing %d", c.name, (long long)r.worstError,
               r.missing);
-        CHECK(r.measured > 250, "%s: measured %d", c.name, r.measured);
+        CHECK(r.measured > 100, "%s: measured %d", c.name, r.measured);
     }
 }
 
@@ -668,6 +670,208 @@ static void testSaveAndLoad() {
     CHECK(std::fabs(peak - 1.0f) < 1e-6f, "click level unchanged (%.6f)", peak);
 }
 
+// ---------------------------------------------------------------------------
+// Tempo, bar grid and quantize
+
+static void testTempoFromFirstLoop() {
+    std::printf("Tempo: the first loop is taken as 1, 2, 4 or 8 bars at 80-160 BPM\n");
+    struct Case { double seconds; int bars; };
+    const Case cases[] = {{2.0, 1}, {4.0, 2}, {3.0, 1}, {2.9, 1}, {6.0, 2}, {10.0, 4}, {1.2, 1}, {30.0, 8}};
+    for (const Case& c : cases) {
+        const int bars = Engine::chooseBars(static_cast<int64_t>(c.seconds * kRate), kRate);
+        std::printf("  %4.1f s -> %d bar%s, %.1f BPM\n", c.seconds, bars, bars == 1 ? "" : "s", 240.0 * bars / c.seconds);
+        CHECK(bars == c.bars, "%.1f s: %d bars, expected %d", c.seconds, bars, c.bars);
+    }
+    Driver d;
+    d.send(ROUNDS_CMD_TAP);
+    d.advance(192000 - 128);
+    d.send(ROUNDS_CMD_TAP);
+    CHECK(status(d.engine).bars == 2, "4 s is 2 bars");
+    d.engine.setBars(4);
+    d.advance(128);
+    CHECK(status(d.engine).bars == 4 && status(d.engine).barLength == 48000, "doubled to 4 bars of %lld",
+          (long long)status(d.engine).barLength);
+    d.engine.setBars(3);
+    d.advance(128);
+    CHECK(status(d.engine).bars == 4, "3 bars is refused");
+}
+
+// Driver with quantize on, a 2-bar base loop playing; helpers to move to a
+// point in the bar.
+struct Grid : Driver {
+    int64_t bar = 0;
+    Grid() {
+        engine.setQuantize(true);
+        send(ROUNDS_CMD_TAP);
+        advance(192000 - 128);
+        send(ROUNDS_CMD_TAP);
+        bar = status(engine).barLength;
+    }
+    int64_t inBar() { return status(engine).cyclePosition % bar; }
+    // Advances to `fraction` of the way through the next bar (or this one if still ahead).
+    void to(double fraction) {
+        const int64_t target = static_cast<int64_t>(fraction * bar);
+        int64_t ahead = target - inBar();
+        if (ahead < 128) ahead += bar;
+        advance(ahead - 128);  // send() runs one more block
+    }
+};
+
+static void testQuantizedActions() {
+    std::printf("Quantize: record, play and stop wait for the next bar\n");
+    Grid g;
+    CHECK(g.bar == 96000, "bar %lld", (long long)g.bar);
+
+    g.to(0.4);
+    g.send(ROUNDS_CMD_TAP, 1);
+    CHECK(g.s(1).state == ROUNDS_LOOP_EMPTY && g.s(1).queued == ROUNDS_QUEUED_TAP, "mid-bar record is queued");
+    g.advance(g.bar / 2);
+    CHECK(g.s(1).state == ROUNDS_LOOP_EMPTY, "still waiting before the bar line");
+    g.advance(g.bar / 5);
+    CHECK(g.s(1).state == ROUNDS_LOOP_RECORDING && g.s(1).queued == 0, "recording from the bar line");
+    CHECK(g.s(1).recordedLength == g.inBar(), "recording started exactly on the bar line (%lld vs %lld)",
+          (long long)g.s(1).recordedLength, (long long)g.inBar());
+
+    g.to(0.03);
+    g.send(ROUNDS_CMD_TAP, 2);
+    CHECK(g.s(2).state == ROUNDS_LOOP_RECORDING, "a tap just after the bar line starts at once");
+    CHECK(g.s(2).recordedLength == g.inBar(), "... from that bar line (%lld vs %lld)",
+          (long long)g.s(2).recordedLength, (long long)g.inBar());
+
+    g.to(0.5);
+    g.send(ROUNDS_CMD_TAP, 3);
+    g.send(ROUNDS_CMD_UNDO_REVERTING_TAP, 3);
+    CHECK(g.s(3).queued == 0, "double-tap takes a queued record back");
+    g.send(ROUNDS_CMD_TAP, 4);
+    g.send(ROUNDS_CMD_STOP, 4);
+    CHECK(g.s(4).queued == 0, "stop takes a queued record back");
+    g.send(ROUNDS_CMD_TAP, 5);
+    g.send(ROUNDS_CMD_TAP, 5);
+    CHECK(g.s(5).queued == 0, "a second tap takes a queued record back");
+    g.advance(g.bar);
+    CHECK(g.s(3).state == ROUNDS_LOOP_EMPTY && g.s(4).state == ROUNDS_LOOP_EMPTY && g.s(5).state == ROUNDS_LOOP_EMPTY,
+          "cancelled loops never started");
+
+    g.to(0.6);
+    g.send(ROUNDS_CMD_STOP, 0);
+    CHECK(g.s(0).state == ROUNDS_LOOP_PLAYING && g.s(0).queued == ROUNDS_QUEUED_STOP, "mid-bar stop is queued");
+    g.advance(g.bar / 2);
+    CHECK(g.s(0).state == ROUNDS_LOOP_STOPPED, "stopped at the bar line");
+    g.to(0.25);
+    g.send(ROUNDS_CMD_TAP, 0);
+    CHECK(g.s(0).queued == ROUNDS_QUEUED_TAP, "restart is queued while others play");
+    g.advance(g.bar);
+    CHECK(g.s(0).state == ROUNDS_LOOP_PLAYING, "restarted on the bar line");
+    CHECK(g.s(0).playPosition % g.bar == g.inBar(), "... in step with the grid (%lld vs %lld)",
+          (long long)(g.s(0).playPosition % g.bar), (long long)g.inBar());
+
+    g.to(0.5);
+    g.send(ROUNDS_CMD_TAP, 0);                 // the press opens an overdub at once...
+    CHECK(g.s(0).state == ROUNDS_LOOP_OVERDUBBING, "overdub isn't quantized");
+    g.send(ROUNDS_CMD_STOP_REVERTING_TAP, 0);  // ...and the hold takes it back and stops
+    CHECK(g.s(0).queued == ROUNDS_QUEUED_STOP && g.s(0).state == ROUNDS_LOOP_PLAYING && g.s(0).layers == 0,
+          "hold drops the overdub and stops on the next bar");
+    g.send(ROUNDS_CMD_UNDO, 0);
+    CHECK(g.s(0).queued == 0 && g.s(0).state == ROUNDS_LOOP_PLAYING, "undo takes a queued stop back");
+}
+
+// Through the simulated interface with latency: a late tap still records the
+// downbeat it was meant for, and a queued recording doesn't pick up what was
+// played before its bar line.
+static void testQuantizedRecordingAudio() {
+    std::printf("Quantize: late and early taps record from the right bar line\n");
+    const int64_t L = 192000;
+    const int64_t bar = L / 2;
+    const int64_t s0 = 1000;
+    Sim sim(200, 300, 128, s0 + 14 * bar);
+    sim.engine.setQuantize(true);
+    sim.engine.send(0, ROUNDS_CMD_TAP, s0);
+    sim.engine.send(0, ROUNDS_CMD_TAP, s0 + L);  // silent 2-bar base; bars at s0 + n * bar
+
+    const int64_t x = s0 + 3 * bar;
+    sim.click(x + 500);                          // played on the downbeat...
+    sim.engine.send(1, ROUNDS_CMD_TAP, x + 3000); // ...pressed 3000 samples late
+    sim.engine.send(1, ROUNDS_CMD_TAP, x + bar + 500);
+
+    const int64_t z = s0 + 6 * bar;
+    sim.click(z - bar / 2 + 1000);               // before the bar line: not recorded
+    sim.click(z + 4000);
+    sim.engine.send(2, ROUNDS_CMD_TAP, z - bar / 2);
+    sim.engine.send(2, ROUNDS_CMD_TAP, z + 2 * bar + 500);
+    sim.run();
+
+    const TimingResult late = measureClicks(sim, {x + 500}, bar, x + bar + 1000, s0 + 14 * bar - 500);
+    std::printf("  late tap:  %d repeats, missing %d, worst %lld samples\n", late.measured, late.missing,
+                (long long)late.worstError);
+    CHECK(late.measured >= 9 && late.missing == 0 && late.worstError == 0, "late tap lost its downbeat");
+    const TimingResult early = measureClicks(sim, {z + 4000}, 2 * bar, z + 2 * bar + 1000, s0 + 14 * bar - 500);
+    std::printf("  early tap: %d repeats, missing %d, worst %lld samples\n", early.measured, early.missing,
+                (long long)early.worstError);
+    CHECK(early.measured >= 3 && early.missing == 0 && early.worstError == 0, "queued recording out of time");
+    float leaked = 0.0f;
+    for (int64_t n = 1; n <= 3; n++) {
+        const int64_t t = z - bar / 2 + 1000 + n * 2 * bar;
+        for (int64_t k = t - 50; k < t + 50; k++) leaked = std::max(leaked, sim.speaker[size_t(k)]);
+    }
+    CHECK(leaked < 0.01f, "audio from before the bar line was recorded (%.3f)", leaked);
+    CHECK(loopStatus(sim.engine, 1).loopLength == bar && loopStatus(sim.engine, 2).loopLength == 2 * bar,
+          "lengths %lld, %lld", (long long)loopStatus(sim.engine, 1).loopLength,
+          (long long)loopStatus(sim.engine, 2).loopLength);
+}
+
+static void testClick() {
+    std::printf("Click: every beat is heard on the grid, accented downbeats\n");
+    const int64_t L = 192000;
+    const int64_t beat = L / 8;
+    const int64_t s0 = 1000;
+    Sim sim(200, 300, 128, s0 + 3 * L);
+    sim.engine.setClickGain(1.0f);
+    sim.engine.send(0, ROUNDS_CMD_TAP, s0);
+    sim.engine.send(0, ROUNDS_CMD_TAP, s0 + L);
+    sim.engine.send(0, ROUNDS_CMD_STOP, s0 + 2 * L + 100);
+    sim.run();
+    int64_t worst = 0;
+    int heard = 0;
+    float down = 0.0f, other = 0.0f;
+    for (int64_t t = s0 + L + beat; t < s0 + 2 * L; t += beat) {
+        int64_t onset = INT64_MIN;
+        float peak = 0.0f;
+        for (int64_t k = t - 300; k < t + 300; k++) {
+            if (onset == INT64_MIN && std::fabs(sim.speaker[size_t(k)]) > 0.05f) onset = k;
+            peak = std::max(peak, std::fabs(sim.speaker[size_t(k)]));
+        }
+        if (onset == INT64_MIN) continue;
+        heard++;
+        worst = std::max<int64_t>(worst, std::llabs(onset - (t + 1)));  // the sine's first non-zero sample
+        (((t - s0) / beat) % 4 == 0 ? down : other) = peak;
+    }
+    std::printf("  %d beats, worst %lld samples off, downbeat %.2f vs %.2f\n", heard, (long long)worst, down, other);
+    CHECK(heard == 7 && worst == 0, "heard %d, worst %lld", heard, (long long)worst);
+    CHECK(down > other * 1.4f, "downbeat accented");
+    float after = 0.0f;
+    for (int64_t t = s0 + 2 * L + 2000; t < s0 + 3 * L; t++) after = std::max(after, std::fabs(sim.speaker[size_t(t)]));
+    CHECK(after < 1e-3f, "click stops when nothing plays (%.4f)", after);
+}
+
+static void testStartStopAll() {
+    std::printf("Play: start/stop all\n");
+    Grid g;
+    g.send(ROUNDS_CMD_TAP, 1);  // queued to the next bar
+    g.advance(g.bar);
+    g.advance(2 * g.bar - 128);
+    g.send(ROUNDS_CMD_TAP, 1);  // a 4-bar loop, so it is the longest
+    CHECK(g.s(1).loopLength == 4 * g.bar, "loop 2 is 4 bars (%lld)", (long long)(g.s(1).loopLength / g.bar));
+    g.engine.send(-1, ROUNDS_CMD_START_STOP_ALL, -1);
+    g.advance(2 * g.bar);
+    CHECK(g.s(0).state == ROUNDS_LOOP_STOPPED && g.s(1).state == ROUNDS_LOOP_STOPPED, "all stopped on a bar line");
+    g.advance(5000);
+    g.engine.send(-1, ROUNDS_CMD_START_STOP_ALL, -1);
+    g.advance(128);
+    CHECK(g.s(0).state == ROUNDS_LOOP_PLAYING && g.s(1).state == ROUNDS_LOOP_PLAYING, "all playing");
+    CHECK(g.s(1).playPosition < 512 && g.inBar() < 512, "from the top of the longest, on a bar line (%lld, %lld)",
+          (long long)g.s(1).playPosition, (long long)g.inBar());
+}
+
 int main() {
     testRecordAndPlaybackAlignment();
     testOverdubAlignment();
@@ -677,12 +881,17 @@ int main() {
     testFootswitchGestures();
     testGestureCommands();
     testManyLayersMerge();
-    testLoopsSnapToBase();
+    testLoopsSnapToBars();
     testLoopsStayInStep();
     testRestartInPhase();
     testSnappedLongerIsSilent();
     testLoopGain();
     testSaveAndLoad();
+    testTempoFromFirstLoop();
+    testQuantizedActions();
+    testQuantizedRecordingAudio();
+    testClick();
+    testStartStopAll();
     std::printf("\n%d checks, %d failed\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }
