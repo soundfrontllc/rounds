@@ -23,6 +23,8 @@ void storeMax(std::atomic<float>& target, float value) {
 }
 
 bool validLoop(int loop) { return loop >= 0 && loop < Engine::kLoops; }
+bool validID(int id) { return id >= 0 && id < Engine::kPool; }
+bool validPart(int part) { return part >= 0 && part < Engine::kParts; }
 
 int64_t wrap(int64_t value, int64_t length) {
     const int64_t r = value % length;
@@ -41,11 +43,15 @@ int Engine::chooseBars(int64_t baseLength, double sampleRate) {
 
 Engine::Engine(double sampleRate, double maxLoopSeconds, int maxBlockFrames)
     : sampleRate_(sampleRate), maxBlock_(maxBlockFrames), kits_(sampleRate), probe_(sampleRate) {
-    for (int i = 0; i < kLoops; i++) {
-        loops_.push_back(std::make_unique<Looper>(looperConfig(sampleRate, maxLoopSeconds)));
+    const Looper::Config config = looperConfig(sampleRate, maxLoopSeconds);
+    layerPool_ = std::make_unique<LayerPool>(kLayers, config.maxLoopSamples);
+    for (int i = 0; i < kPool; i++) {
+        loops_.push_back(std::make_unique<Looper>(config, layerPool_.get()));
         loopGain_[static_cast<size_t>(i)].store(1.0f);
     }
-    for (int i = 0; i < kLoops + 2; i++) players_.push_back(std::make_unique<Player>(sampleRate, &kits_));
+    for (int i = 0; i < kPool + 2; i++) players_.push_back(std::make_unique<Player>(sampleRate, &kits_));
+    resetParts();
+    for (int i = 0; i < kParts * kLoops; i++) statPartLoops_[static_cast<size_t>(i)].store(i);
     players_[kPadsPlayer]->setInstrument(ROUNDS_INSTRUMENT_DRY_KIT);
     transferNotes_.resize(static_cast<size_t>(loops_[0]->maxNotes()));
     zeros_.assign(static_cast<size_t>(maxBlockFrames), 0.0f);
@@ -120,13 +126,52 @@ void Engine::setLatency(int inputLatency, int outputLatency) {
     outputLatency_.store(outputLatency);
 }
 
-void Engine::setLoopGain(int loop, float gain) {
-    if (validLoop(loop)) loopGain_[static_cast<size_t>(loop)].store(std::max(0.0f, gain));
+void Engine::setLoopGain(int loopID, float gain) {
+    if (validID(loopID)) loopGain_[static_cast<size_t>(loopID)].store(std::max(0.0f, gain));
+}
+
+bool Engine::switchPart(int part) {
+    if (!validPart(part)) return false;
+    return push(Command{part, kCmdSwitchPart, -1});
+}
+
+bool Engine::newPart() { return push(Command{-1, kCmdNewPart, -1}); }
+
+bool Engine::setShared(int loopID, bool shared) {
+    if (!validID(loopID)) return false;
+    Command command{loopID, kCmdShared, -1};
+    command.velocity = shared ? 1 : 0;
+    return push(command);
+}
+
+bool Engine::reset() { return push(Command{-1, kCmdReset, -1}); }
+
+bool Engine::setPartLoop(int part, int slot, int loopID) {
+    if (!validPart(part) || !validLoop(slot) || !validID(loopID)) return false;
+    Command command{part, kCmdPartLoop, -1};
+    command.note = static_cast<int16_t>(slot);
+    command.instrument = static_cast<int16_t>(loopID);
+    return push(command);
+}
+
+int Engine::partLoop(int part, int slot) const {
+    if (!validPart(part) || !validLoop(slot)) return -1;
+    return statPartLoops_[static_cast<size_t>(part * kLoops + slot)].load(std::memory_order_relaxed);
+}
+
+void Engine::getPartStatus(int part, RoundsPartStatus* out) {
+    *out = RoundsPartStatus{};
+    if (!validPart(part)) return;
+    const PartStats& p = partStats_[static_cast<size_t>(part)];
+    out->exists = p.exists.load();
+    out->loops = p.loops.load();
+    out->cycleLength = p.cycle.load();
 }
 
 void Engine::getStatus(RoundsStatus* out) {
     out->baseLength = statBase_.load();
     out->baseLoop = statBaseLoop_.load();
+    out->baseLoopID = statBaseID_.load();
     out->bars = statBars_.load();
     out->barLength = statBarLength_.load();
     out->cycleLength = statCycle_.load();
@@ -139,11 +184,20 @@ void Engine::getStatus(RoundsStatus* out) {
     out->calibrating = statCalibrating_.load();
     out->sampleTime = statNow_.load();
     out->sampleRate = sampleRate_;
+    out->part = statPart_.load();
+    out->nextPart = statNextPart_.load();
+    out->partSwitchIn = statSwitchIn_.load();
 }
 
-void Engine::getLoopStatus(int loop, RoundsLoopStatus* out) {
+void Engine::getLoopStatus(int slot, RoundsLoopStatus* out) {
     *out = RoundsLoopStatus{};
-    if (!validLoop(loop)) return;
+    if (!validLoop(slot)) return;
+    getPoolLoopStatus(partLoop(statPart_.load(std::memory_order_relaxed), slot), out);
+}
+
+void Engine::getPoolLoopStatus(int loop, RoundsLoopStatus* out) {
+    *out = RoundsLoopStatus{};
+    if (!validID(loop)) return;
     LoopStats& s = loopStats_[static_cast<size_t>(loop)];
     out->state = s.state.load();
     out->loopLength = s.length.load();
@@ -157,20 +211,22 @@ void Engine::getLoopStatus(int loop, RoundsLoopStatus* out) {
     out->kind = s.kind.load();
     out->instrument = s.instrument.load();
     out->notes = s.notes.load();
+    out->loopID = loop;
+    out->shared = s.shared.load();
 }
 
 // ---------------------------------------------------------------------------
 // Session transfer (non-real-time side)
 
 bool Engine::beginExport(int loop) {
-    if (!validLoop(loop) || transfer_.load(std::memory_order_acquire) != kIdle) return false;
+    if (!validID(loop) || transfer_.load(std::memory_order_acquire) != kIdle) return false;
     transferLoop_ = loop;
     transfer_.store(kExportRequested, std::memory_order_release);
     return true;
 }
 
 bool Engine::beginImport(int loop, const float* samples, int64_t length) {
-    if (!validLoop(loop) || length <= 0 || length > maxLoopSamples()) return false;
+    if (!validID(loop) || length <= 0 || length > maxLoopSamples()) return false;
     if (transfer_.load(std::memory_order_acquire) != kIdle) return false;
     std::memcpy(transferBuffer_.data(), samples, sizeof(float) * static_cast<size_t>(length));
     transferLoop_ = loop;
@@ -181,7 +237,7 @@ bool Engine::beginImport(int loop, const float* samples, int64_t length) {
 }
 
 bool Engine::beginImportNotes(int loop, const RoundsNote* notes, int count, int64_t length, int instrument) {
-    if (!validLoop(loop) || length <= 1 || length > maxLoopSamples() || count < 0 || count > maxNotes()) return false;
+    if (!validID(loop) || length <= 1 || length > maxLoopSamples() || count < 0 || count > maxNotes()) return false;
     if (instrument < 0 || instrument >= ROUNDS_INSTRUMENT_COUNT) return false;
     if (transfer_.load(std::memory_order_acquire) != kIdle) return false;
     std::copy(notes, notes + count, transferNotes_.begin());
@@ -239,27 +295,245 @@ void Engine::emit(RoundsEventType type, int loop, int64_t value) {
     events_.push(RoundsEvent{type, loop, value, now_});  // dropped if the UI isn't reading
 }
 
-bool Engine::anyAudible() const {
-    for (const auto& looper : loops_) {
-        if (looper->state() == Looper::State::Playing || looper->state() == Looper::State::Overdubbing) return true;
-    }
-    return false;
-}
-
 bool Engine::importing(int loop) const {
     const int state = transfer_.load(std::memory_order_relaxed);
     return (state == kImportRequested || state == kImporting) && loop == transferLoop_;
 }
 
+// Anything recording or playing in the playing part.
 bool Engine::running() const {
-    for (const auto& looper : loops_) {
-        if (looper->state() != Looper::State::Empty && looper->state() != Looper::State::Stopped) return true;
+    for (int slot = 0; slot < kLoops; slot++) {
+        const Looper::State state = loops_[static_cast<size_t>(slotLoop(slot))]->state();
+        if (state != Looper::State::Empty && state != Looper::State::Stopped) return true;
     }
     return false;
 }
 
+bool Engine::inPart(int part, int id) const {
+    for (int slot : partLoops_[static_cast<size_t>(part)]) {
+        if (slot == id) return true;
+    }
+    return false;
+}
+
+// Heard right now: in the playing part, and playing or overdubbing.
+bool Engine::audible(int id) const {
+    const Looper::State state = loops_[static_cast<size_t>(id)]->state();
+    return (state == Looper::State::Playing || state == Looper::State::Overdubbing) && inPart(part_, id);
+}
+
+int Engine::longestInPart() const {
+    int longest = -1;
+    for (int slot = 0; slot < kLoops; slot++) {
+        const int id = slotLoop(slot);
+        if (loops_[static_cast<size_t>(id)]->loopLength() <= 0) continue;
+        if (longest < 0 || loops_[static_cast<size_t>(id)]->loopLength() > loops_[static_cast<size_t>(longest)]->loopLength()) {
+            longest = id;
+        }
+    }
+    return longest;
+}
+
 bool Engine::quantizing() const {
     return barLength_ > 0 && quantize_.load(std::memory_order_relaxed) && running();
+}
+
+// ---------------------------------------------------------------------------
+// Parts
+
+void Engine::resetParts() {
+    for (int p = 0; p < kParts; p++) {
+        for (int slot = 0; slot < kLoops; slot++) partLoops_[static_cast<size_t>(p)][static_cast<size_t>(slot)] = p * kLoops + slot;
+        partExists_[static_cast<size_t>(p)] = p == 0;
+    }
+    part_ = 0;
+    nextPart_ = -1;
+    for (Copy& c : copies_) c = Copy{};
+}
+
+// A loop for a new part's slot that no part uses: its own, unless a loaded
+// session gave that one to another part.
+int Engine::freeLoopFor(int part, int slot) const {
+    auto used = [this](int id) {
+        for (int p = 0; p < kParts; p++) {
+            if (partExists_[static_cast<size_t>(p)] && inPart(p, id)) return true;
+        }
+        return false;
+    };
+    const int own = part * kLoops + slot;
+    if (!used(own)) return own;
+    for (int id = 0; id < kPool; id++) {
+        if (!used(id)) return id;
+    }
+    return -1;
+}
+
+void Engine::createPart() {
+    for (const Copy& c : copies_) {
+        if (c.to >= 0) return;  // the last new part is still being copied
+    }
+    int part = -1;
+    for (int p = 0; p < kParts && part < 0; p++) {
+        if (!partExists_[static_cast<size_t>(p)]) part = p;
+    }
+    if (part < 0) {
+        emit(ROUNDS_EVENT_PART_CREATED, -1, -1);
+        return;
+    }
+    auto& slots = partLoops_[static_cast<size_t>(part)];
+    slots.fill(-1);
+    partExists_[static_cast<size_t>(part)] = true;
+    for (int slot = 0; slot < kLoops; slot++) {
+        const int from = slotLoop(slot);
+        if (shared_[static_cast<size_t>(from)]) {
+            slots[static_cast<size_t>(slot)] = from;
+            continue;
+        }
+        // 64 loops for 8 parts of 8: there is always one.
+        const int to = freeLoopFor(part, slot);
+        slots[static_cast<size_t>(slot)] = to;
+        Looper& dest = *loops_[static_cast<size_t>(to)];
+        cancelScheduled(to);
+        dest.clear();
+        players_[static_cast<size_t>(to)]->setInstrument(players_[static_cast<size_t>(from)]->instrument());
+        loopGain_[static_cast<size_t>(to)].store(loopGain_[static_cast<size_t>(from)].load(std::memory_order_relaxed),
+                                                std::memory_order_relaxed);
+        shared_[static_cast<size_t>(to)] = false;
+        const Looper& source = *loops_[static_cast<size_t>(from)];
+        const Looper::State state = source.state();
+        if (state == Looper::State::Empty || state == Looper::State::Recording) continue;
+        if (source.kind() == Looper::Kind::Midi) {
+            dest.finishCopy(source);
+        } else {
+            copies_[static_cast<size_t>(slot)] = Copy{from, to, source.loopLength(), 0};
+        }
+    }
+    emit(ROUNDS_EVENT_PART_CREATED, -1, part);
+    requestSwitch(part);
+}
+
+// Copies a slice of the new part's loops after each block.
+void Engine::stepCopies() {
+    int64_t budget = kCopySlice;
+    for (Copy& c : copies_) {
+        if (c.to < 0 || budget <= 0) continue;
+        const Looper& source = *loops_[static_cast<size_t>(c.from)];
+        Looper& dest = *loops_[static_cast<size_t>(c.to)];
+        if (source.loopLength() != c.length || source.state() == Looper::State::Recording) {
+            dest.clear();  // re-recorded or cleared mid-copy: leave the slot empty
+            c = Copy{};
+            continue;
+        }
+        const int64_t count = std::min(budget, c.length - c.pos);
+        dest.copySlice(source, c.pos, count);
+        c.pos += count;
+        budget -= count;
+        if (c.pos >= c.length) {
+            dest.finishCopy(source);
+            c = Copy{};
+        }
+    }
+}
+
+void Engine::requestSwitch(int part) {
+    if (!validPart(part) || !partExists_[static_cast<size_t>(part)]) return;
+    if (part == part_ || part == nextPart_) {
+        // The playing part, or the one already waiting: take the switch back.
+        if (nextPart_ >= 0) emit(ROUNDS_EVENT_PART_QUEUED, -1, -1);
+        nextPart_ = -1;
+        return;
+    }
+    nextPart_ = part;
+    scheduleSwitch();
+    if (!switchNow_) emit(ROUNDS_EVENT_PART_QUEUED, -1, part);
+}
+
+// The switch is heard where the longest loop of the playing part comes round.
+void Engine::scheduleSwitch() {
+    const int64_t now = clock();
+    const int longest = longestInPart();
+    switchNow_ = !running() || longest < 0;
+    if (switchNow_) {
+        switchAt_ = now;
+        switchOrigin_ = now;
+        return;
+    }
+    const Looper& looper = *loops_[static_cast<size_t>(longest)];
+    const int64_t cycle = looper.loopLength();
+    const int64_t heard = now + outputLatency_.load(std::memory_order_relaxed);
+    const int64_t into = wrap(heard - looper.origin(), cycle);
+    switchOrigin_ = into == 0 ? heard : heard + cycle - into;
+    switchAt_ = switchOrigin_ - (heard - now);
+}
+
+void Engine::fireSwitch() {
+    for (const Copy& c : copies_) {
+        if (c.to < 0) continue;
+        // Still copying (a long loop, made just before the cycle ended): try
+        // again at the end of the next cycle, or the next block if stopped.
+        if (!switchNow_) scheduleSwitch();
+        return;
+    }
+    const int from = part_;
+    const int to = nextPart_;
+    for (int id : partLoops_[static_cast<size_t>(from)]) {
+        if (inPart(to, id)) continue;
+        Looper& looper = *loops_[static_cast<size_t>(id)];
+        cancelScheduled(id);
+        // Leaving the part closes a recording or overdub, keeping what was played.
+        if (looper.state() == Looper::State::Recording || looper.state() == Looper::State::Overdubbing) {
+            looper.setBarLength(barLength_);
+            looper.tap();
+            if (looper.state() == Looper::State::Recording) looper.clear();  // too short to keep
+        }
+    }
+    for (int id : partLoops_[static_cast<size_t>(to)]) {
+        if (inPart(from, id)) continue;
+        Looper& looper = *loops_[static_cast<size_t>(id)];
+        if (switchNow_) {
+            if (looper.state() == Looper::State::Playing) looper.stop();
+        } else {
+            looper.shiftOrigin(switchOrigin_ - looper.origin());  // from the top
+        }
+    }
+    part_ = to;
+    nextPart_ = -1;
+    resyncPublished();
+    emit(ROUNDS_EVENT_PART_CHANGED, -1, to);
+    updateBase();
+    releaseStaleNotes();
+    publish();
+}
+
+// A part's slots are reported as they are, without an event per slot.
+void Engine::resyncPublished() {
+    for (int slot = 0; slot < kLoops; slot++) {
+        const int id = slotLoop(slot);
+        const Looper& looper = *loops_[static_cast<size_t>(id)];
+        Published& last = published_[static_cast<size_t>(slot)];
+        last.state = static_cast<int>(looper.state());
+        last.length = looper.loopLength();
+        last.layers = looper.closedLayers();
+        last.queued = scheduled_[static_cast<size_t>(id)].action;
+    }
+}
+
+// Keeps a few shared layers free by merging the oldest one anywhere into its
+// loop's base (a slice per block), so an overdub never finds the pool empty.
+void Engine::keepLayersFree() {
+    if (layerPool_->freeCount() >= 3) return;
+    int oldest = -1;
+    uint64_t age = 0;
+    for (int id = 0; id < kPool; id++) {
+        const Looper& looper = *loops_[static_cast<size_t>(id)];
+        if (looper.merging()) return;  // one at a time
+        const uint64_t a = looper.oldestLayerAge();
+        if (a != 0 && (oldest < 0 || a < age)) {
+            oldest = id;
+            age = a;
+        }
+    }
+    if (oldest >= 0) loops_[static_cast<size_t>(oldest)]->mergeOldestLayer();
 }
 
 // Moves every loop's phase, and the bar grid with them.
@@ -276,14 +550,39 @@ bool Engine::cancelScheduled(int loop) {
 }
 
 void Engine::apply(const Command& command) {
-    const int loop = command.loop;
     const int32_t cmd = command.cmd;
+    // Slot commands act on the loop in that slot of the playing part.
+    const int loop = validLoop(command.loop) ? slotLoop(command.loop) : -1;
     if (cmd == kCmdNote) {
-        applyNote(command);
+        applyNote(command, loop);
     } else if (cmd == kCmdInstrument) {
         players_[static_cast<size_t>(loop)]->setInstrument(command.instrument);
     } else if (cmd == ROUNDS_CMD_START_STOP_ALL) {
         startStopAll();
+    } else if (cmd == kCmdSwitchPart) {
+        requestSwitch(command.loop);
+    } else if (cmd == kCmdNewPart) {
+        createPart();
+    } else if (cmd == kCmdShared) {
+        shared_[static_cast<size_t>(command.loop)] = command.velocity != 0;
+    } else if (cmd == kCmdReset) {
+        for (int id = 0; id < kPool; id++) {
+            cancelScheduled(id);
+            loops_[static_cast<size_t>(id)]->clear();
+            shared_[static_cast<size_t>(id)] = false;
+        }
+        resetParts();
+        resyncPublished();
+        emit(ROUNDS_EVENT_PART_CHANGED, -1, 0);
+    } else if (cmd == kCmdPartLoop) {
+        const size_t part = static_cast<size_t>(command.loop);
+        if (!partExists_[part]) {
+            // A part made by a session load starts as its own loops.
+            for (int slot = 0; slot < kLoops; slot++) partLoops_[part][static_cast<size_t>(slot)] = command.loop * kLoops + slot;
+            partExists_[part] = true;
+        }
+        partLoops_[part][static_cast<size_t>(command.note)] = command.instrument;
+        if (static_cast<int>(part) == part_) resyncPublished();
     } else {
         if (importing(loop)) return;  // the loop is being loaded from a session
         Looper& looper = *loops_[static_cast<size_t>(loop)];
@@ -325,25 +624,26 @@ void Engine::apply(const Command& command) {
     publish();
 }
 
-void Engine::applyNote(const Command& command) {
+// `id`: the loop in the note's slot, -1 for none.
+void Engine::applyNote(const Command& command, int id) {
     const int note = command.note;
     const int velocity = command.velocity;
     const int64_t when = command.when;
     Player& preview = *players_[isDrumKit(command.instrument) ? kPadsPlayer : kKeysPlayer];
-    const bool slot = validLoop(command.loop) && !importing(command.loop);
+    const bool slot = id >= 0 && !importing(id);
     if (velocity == 0) {
         // Released wherever it may have been played: the loop can have
         // changed kind since the key went down.
         preview.noteOff(note, false);
         if (slot) {
-            players_[static_cast<size_t>(command.loop)]->noteOff(note, false);
-            loops_[static_cast<size_t>(command.loop)]->noteReleased(note, when);
+            players_[static_cast<size_t>(id)]->noteOff(note, false);
+            loops_[static_cast<size_t>(id)]->noteReleased(note, when);
         }
         return;
     }
     if (slot) {
-        Looper& looper = *loops_[static_cast<size_t>(command.loop)];
-        Player& player = *players_[static_cast<size_t>(command.loop)];
+        Looper& looper = *loops_[static_cast<size_t>(id)];
+        Player& player = *players_[static_cast<size_t>(id)];
         const Looper::State state = looper.state();
         const bool midi = looper.kind() == Looper::Kind::Midi && state != Looper::State::Empty;
         const bool canBecomeMidi = state == Looper::State::Empty || (state == Looper::State::Recording && !midi);
@@ -361,10 +661,9 @@ void Engine::applyNote(const Command& command) {
 
 // A MIDI loop that stops or loses notes (undo, clear) lets go of what it was playing.
 void Engine::releaseStaleNotes() {
-    for (int i = 0; i < kLoops; i++) {
+    for (int i = 0; i < kPool; i++) {
         const Looper& looper = *loops_[static_cast<size_t>(i)];
-        const bool audible = looper.kind() == Looper::Kind::Midi &&
-                             (looper.state() == Looper::State::Playing || looper.state() == Looper::State::Overdubbing);
+        const bool audible = looper.kind() == Looper::Kind::Midi && this->audible(i);
         const int notes = looper.noteCount();
         if ((midiAudible_[static_cast<size_t>(i)] && !audible) || notes < midiNotes_[static_cast<size_t>(i)]) {
             players_[static_cast<size_t>(i)]->releaseLoopNotes();
@@ -434,7 +733,8 @@ void Engine::stop(int loop) {
 // together from the top of the longest one.
 void Engine::startStopAll() {
     if (running()) {
-        for (int i = 0; i < kLoops; i++) {
+        for (int slot = 0; slot < kLoops; slot++) {
+            const int i = slotLoop(slot);
             const Looper::State state = loops_[static_cast<size_t>(i)]->state();
             if (state == Looper::State::Empty || state == Looper::State::Stopped) {
                 cancelScheduled(i);
@@ -445,7 +745,8 @@ void Engine::startStopAll() {
         return;
     }
     int longest = -1;
-    for (int i = 0; i < kLoops; i++) {
+    for (int slot = 0; slot < kLoops; slot++) {
+        const int i = slotLoop(slot);
         cancelScheduled(i);
         const Looper& looper = *loops_[static_cast<size_t>(i)];
         if (looper.state() == Looper::State::Stopped &&
@@ -455,8 +756,9 @@ void Engine::startStopAll() {
     }
     if (longest < 0) return;
     shiftAll(clock() - loops_[static_cast<size_t>(longest)]->origin());
-    for (auto& looper : loops_) {
-        if (looper->state() == Looper::State::Stopped) looper->tap();
+    for (int slot = 0; slot < kLoops; slot++) {
+        Looper& looper = *loops_[static_cast<size_t>(slotLoop(slot))];
+        if (looper.state() == Looper::State::Stopped) looper.tap();
     }
 }
 
@@ -475,7 +777,7 @@ void Engine::fireScheduled(int loop) {
 // The first loop to get a length sets the tempo; it resets once every loop is empty.
 void Engine::updateBase() {
     bool anyLoop = false;
-    for (int i = 0; i < kLoops; i++) {
+    for (int i = 0; i < kPool; i++) {
         const Looper& looper = *loops_[static_cast<size_t>(i)];
         if (looper.state() != Looper::State::Empty) anyLoop = true;
         if (baseLength_ == 0 && looper.loopLength() > 0) {
@@ -505,7 +807,8 @@ void Engine::publish() {
     // Looper::State and RoundsLoopState share their order.
     static_assert(static_cast<int>(Looper::State::Stopped) == ROUNDS_LOOP_STOPPED, "state order");
     for (int i = 0; i < kLoops; i++) {
-        const Looper& looper = *loops_[static_cast<size_t>(i)];
+        const int id = slotLoop(i);
+        const Looper& looper = *loops_[static_cast<size_t>(id)];
         Published& last = published_[static_cast<size_t>(i)];
         const int state = static_cast<int>(looper.state());
         if (state != last.state) {
@@ -520,7 +823,7 @@ void Engine::publish() {
             last.layers = looper.closedLayers();
             emit(ROUNDS_EVENT_LAYER_COUNT, i, last.layers);
         }
-        const int queued = scheduled_[static_cast<size_t>(i)].action;
+        const int queued = scheduled_[static_cast<size_t>(id)].action;
         if (queued != last.queued) {
             last.queued = queued;
             emit(ROUNDS_EVENT_QUEUED, i, queued);
@@ -648,13 +951,22 @@ void Engine::processChunk(const float* input, float* out, int frames, int64_t st
         }
         return;
     }
-    for (int l = 0; l < kLoops; l++) {
-        std::memset(scratch_.data(), 0, sizeof(float) * static_cast<size_t>(frames));
+    heard_.fill(false);
+    for (int slot = 0; slot < kLoops; slot++) heard_[static_cast<size_t>(slotLoop(slot))] = true;
+    for (int l = 0; l < kPool; l++) {
         Looper& looper = *loops_[static_cast<size_t>(l)];
+        Player& player = *players_[static_cast<size_t>(l)];
         const float gain = loopGain_[static_cast<size_t>(l)].load(std::memory_order_relaxed);
+        if (!heard_[static_cast<size_t>(l)]) {
+            // Another part's loop keeps time; its notes ring out after a switch.
+            looper.process(input, nullptr, frames, gain);
+            player.render(out, frames, gain, nullptr, 0);
+            continue;
+        }
+        std::memset(scratch_.data(), 0, sizeof(float) * static_cast<size_t>(frames));
         const int events = looper.collectNotes(frames, noteEvents_.data(), static_cast<int>(noteEvents_.size()));
         looper.process(input, scratch_.data(), frames, gain);
-        players_[static_cast<size_t>(l)]->render(scratch_.data(), frames, gain, noteEvents_.data(), events);
+        player.render(scratch_.data(), frames, gain, noteEvents_.data(), events);
         float peak = chunkPeak_[static_cast<size_t>(l)];
         for (int i = 0; i < frames; i++) {
             out[i] += scratch_[static_cast<size_t>(i)];
@@ -726,16 +1038,18 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
             pendingCount_--;
             apply(command);
         }
-        for (int l = 0; l < kLoops; l++) {
+        for (int l = 0; l < kPool; l++) {
             if (scheduled_[static_cast<size_t>(l)].action != kNone && scheduled_[static_cast<size_t>(l)].time <= at) {
                 fireScheduled(l);
             }
         }
+        if (nextPart_ >= 0 && switchAt_ <= at) fireSwitch();
         int64_t chunk = frames - pos;
         if (pendingCount_ > 0) chunk = std::min<int64_t>(chunk, pending_[0].time - at);
         for (const Scheduled& s : scheduled_) {
             if (s.action != kNone) chunk = std::min<int64_t>(chunk, s.time - at);
         }
+        if (nextPart_ >= 0 && switchAt_ > at) chunk = std::min<int64_t>(chunk, switchAt_ - at);
         processChunk(input + pos, outL + pos, static_cast<int>(chunk), at);
         pos += static_cast<int>(chunk);
     }
@@ -750,12 +1064,14 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
 
     now_ += frames;
     stepTransfer();
+    stepCopies();
+    keepLayersFree();
     updateBase();  // a loop can close itself when it runs out of room
     releaseStaleNotes();
     publish();
     storeMax(statInputPeak_, inPeak);
     storeMax(statOutputPeak_, outPeak);
-    for (int l = 0; l < kLoops; l++) {
+    for (int l = 0; l < kPool; l++) {
         const Looper& looper = *loops_[static_cast<size_t>(l)];
         LoopStats& s = loopStats_[static_cast<size_t>(l)];
         storeMax(s.peak, chunkPeak_[static_cast<size_t>(l)]);
@@ -769,16 +1085,40 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
         s.kind.store(looper.kind() == Looper::Kind::Midi ? ROUNDS_KIND_MIDI : ROUNDS_KIND_AUDIO, std::memory_order_relaxed);
         s.instrument.store(players_[static_cast<size_t>(l)]->instrument(), std::memory_order_relaxed);
         s.notes.store(looper.noteCount(), std::memory_order_relaxed);
+        s.shared.store(shared_[static_cast<size_t>(l)] ? 1 : 0, std::memory_order_relaxed);
     }
-    int64_t cycle = 0;
-    for (const auto& looper : loops_) cycle = std::max(cycle, looper->loopLength());
+    for (int p = 0; p < kParts; p++) {
+        int loops = 0;
+        int64_t partCycle = 0;
+        for (int slot = 0; slot < kLoops; slot++) {
+            const int id = partLoops_[static_cast<size_t>(p)][static_cast<size_t>(slot)];
+            statPartLoops_[static_cast<size_t>(p * kLoops + slot)].store(id, std::memory_order_relaxed);
+            const Looper& looper = *loops_[static_cast<size_t>(id)];
+            if (looper.state() != Looper::State::Empty) loops++;
+            partCycle = std::max(partCycle, looper.loopLength());
+        }
+        PartStats& ps = partStats_[static_cast<size_t>(p)];
+        ps.exists.store(partExists_[static_cast<size_t>(p)] ? 1 : 0, std::memory_order_relaxed);
+        ps.loops.store(loops, std::memory_order_relaxed);
+        ps.cycle.store(partCycle, std::memory_order_relaxed);
+    }
+    statPart_.store(part_, std::memory_order_relaxed);
+    statNextPart_.store(nextPart_, std::memory_order_relaxed);
+    statSwitchIn_.store(nextPart_ >= 0 ? std::max<int64_t>(0, switchOrigin_ - (now_ + out)) : -1, std::memory_order_relaxed);
+    const int64_t cycle = partStats_[static_cast<size_t>(part_)].cycle.load(std::memory_order_relaxed);
     statBars_.store(bars_, std::memory_order_relaxed);
     statBarLength_.store(barLength_, std::memory_order_relaxed);
     statCycle_.store(cycle, std::memory_order_relaxed);
     statCyclePosition_.store(cycle > 0 ? wrap(now_ + out - gridOrigin_, cycle) : 0, std::memory_order_relaxed);
     statRunning_.store(running() ? 1 : 0, std::memory_order_relaxed);
     statBase_.store(baseLength_, std::memory_order_relaxed);
-    statBaseLoop_.store(baseLoop_, std::memory_order_relaxed);
+    // The base loop's slot in the playing part (-1 if it is in another part).
+    int baseSlot = -1;
+    for (int slot = 0; slot < kLoops; slot++) {
+        if (baseLoop_ >= 0 && slotLoop(slot) == baseLoop_) baseSlot = slot;
+    }
+    statBaseLoop_.store(baseSlot, std::memory_order_relaxed);
+    statBaseID_.store(baseLoop_, std::memory_order_relaxed);
     statCalibrating_.store(probe_.active() ? 1 : 0, std::memory_order_relaxed);
     statNow_.store(now_, std::memory_order_relaxed);
 }

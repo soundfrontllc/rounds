@@ -13,6 +13,7 @@ struct ContentView: View {
             HStack(alignment: .top, spacing: 16) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
+                        PartsStrip()
                         LoopLanes()
                         SoundsPanel()
                         loopPanel
@@ -93,13 +94,13 @@ struct ContentView: View {
             HStack(spacing: 6) {
                 Text(tempoText).font(.system(.body, design: .monospaced).weight(.semibold))
                 if model.bars > 0 {
-                    Text("set by loop \(model.baseLoop + 1)").foregroundStyle(.secondary)
+                    Text("set by \(baseName)").foregroundStyle(.secondary)
                     Button("½×") { model.halveTempo() }
                         .disabled(model.bars <= 1)
-                        .help("Half the tempo: take loop \(model.baseLoop + 1) as half as many bars")
+                        .help("Half the tempo: take \(baseName) as half as many bars")
                     Button("2×") { model.doubleTempo() }
                         .disabled(model.bars >= 8)
-                        .help("Double the tempo: take loop \(model.baseLoop + 1) as twice as many bars")
+                        .help("Double the tempo: take \(baseName) as twice as many bars")
                 }
             }
             Text(positionLabel)
@@ -113,6 +114,11 @@ struct ContentView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
+    }
+
+    /// The base loop may be in another part.
+    private var baseName: String {
+        model.baseLoop >= 0 ? "loop \(model.baseLoop + 1)" : "the first loop"
     }
 
     private var tempoText: String {
@@ -131,6 +137,9 @@ struct ContentView: View {
             HStack(alignment: .firstTextBaseline) {
                 Text("Loop \(model.selectedLoop + 1)").font(.headline)
                 StateBadge(state: model.state)
+                Toggle("Shared", isOn: Binding(get: { model.loops[model.selectedLoop].shared }, set: { model.setShared($0) }))
+                    .disabled(!model.audioRunning)
+                    .help("A shared loop (like the beat) stays the same loop in new parts; other loops are copied")
                 Spacer()
                 Text(lengthText).font(.system(.title3, design: .monospaced))
                 Text("· \(model.layers) layer\(model.layers == 1 ? "" : "s")").foregroundStyle(.secondary)
@@ -246,7 +255,8 @@ struct LoopLanes: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text("Loops").font(.headline)
+                Text("\(model.partNames[model.currentPart]) loops").font(.headline)
+                Text("top pad row").foregroundStyle(.secondary).font(.callout)
                 Spacer()
                 Text(baseText).font(.callout).foregroundStyle(.secondary)
             }
@@ -284,11 +294,20 @@ struct LoopLane: View {
             Text(lengthText)
                 .font(.system(.callout, design: .monospaced))
                 .frame(width: 120, alignment: .leading)
-            Text(kindText)
-                .font(.callout)
-                .foregroundStyle(loop.midi ? Color.blue : .secondary)
-                .lineLimit(1)
-                .frame(width: 150, alignment: .leading)
+            HStack(spacing: 4) {
+                Text(kindText)
+                    .foregroundStyle(loop.midi ? Color.blue : .secondary)
+                    .lineLimit(1)
+                if loop.shared {
+                    Text("Shared")
+                        .font(.caption.weight(.medium))
+                        .padding(.horizontal, 5)
+                        .background(Capsule().fill(Color.secondary.opacity(0.18)))
+                        .help("This loop is in every part made from this one")
+                }
+            }
+            .font(.callout)
+            .frame(width: 200, alignment: .leading)
             ProgressView(value: loop.state == .recording ? 1 : loop.position)
                 .tint(loop.state == .empty ? .secondary : loop.color)
                 .animation(nil, value: loop.position)
@@ -328,6 +347,86 @@ struct LoopLane: View {
         case .tap: return loop.state == .empty ? "Record next bar" : "Play next bar"
         case .stop: return "Stop next bar"
         }
+    }
+}
+
+// MARK: - Parts
+
+struct PartsStrip: View {
+    @EnvironmentObject var model: LooperModel
+    @State private var renaming: Int?
+    @State private var newName = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Parts").font(.headline)
+                Text("Shift + loop pad to switch · changes land at the end of the cycle")
+                    .foregroundStyle(.secondary).font(.callout)
+            }
+            HStack(spacing: 8) {
+                ForEach(model.parts.filter(\.exists)) { part in
+                    card(part)
+                        .contentShape(Rectangle())
+                        .onTapGesture { model.switchPart(part.id) }
+                        .contextMenu {
+                            Button("Rename…") {
+                                newName = model.partNames[part.id]
+                                renaming = part.id
+                            }
+                        }
+                }
+                if model.parts.contains(where: { !$0.exists }) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("+ New part").font(.callout.weight(.semibold))
+                        Text("Copies \(model.partNames[model.currentPart]), keeps shared loops")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .padding(10)
+                    .frame(minWidth: 150, alignment: .leading)
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.35),
+                                                                      style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
+                    .contentShape(Rectangle())
+                    .onTapGesture { model.newPart() }
+                    .disabled(!model.audioRunning)
+                }
+            }
+        }
+        .disabled(!model.audioRunning)
+        .alert("Rename part", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
+            TextField("Name", text: $newName)
+            Button("Rename") {
+                if let part = renaming { model.renamePart(part, to: newName) }
+                renaming = nil
+            }
+            Button("Cancel", role: .cancel) { renaming = nil }
+        }
+    }
+
+    private func card(_ part: PartInfo) -> some View {
+        let playing = part.id == model.currentPart
+        let next = part.id == model.nextPart
+        return VStack(alignment: .leading, spacing: 3) {
+            Text(model.partTitle(part.id)).font(.callout.weight(.semibold))
+            Text(detail(part, playing: playing, next: next))
+                .font(.caption)
+                .foregroundStyle(next ? Color.orange : playing ? Color.green : .secondary)
+        }
+        .padding(10)
+        .frame(minWidth: 150, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(playing ? Color.green.opacity(0.12) : Color(nsColor: .controlBackgroundColor)))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(next ? Color.orange : playing ? Color.green : Color.secondary.opacity(0.25),
+                                                          lineWidth: next || playing ? 2 : 1))
+    }
+
+    private func detail(_ part: PartInfo, playing: Bool, next: Bool) -> String {
+        let size = part.loops == 0 ? "Empty"
+            : "\(part.cycleBars > 0 ? LooperModel.barsText(part.cycleBars) + " · " : "")\(part.loops) loop\(part.loops == 1 ? "" : "s")"
+        if next {
+            return model.partSwitchBars > 0 ? String(format: "Up next · in %.1f bars", model.partSwitchBars) : "Up next"
+        }
+        if playing { return (model.running ? "Playing · " : "Stopped · ") + size }
+        return size
     }
 }
 

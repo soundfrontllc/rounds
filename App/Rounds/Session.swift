@@ -7,10 +7,14 @@ import Foundation
 /// the manifest. Each loop is saved with its overdubs merged (undo history
 /// isn't kept), rotated so every loop starts at the base loop's top: the
 /// loops line up when the files are laid side by side.
+///
+/// Loops are numbered by the engine's loop ID: part p's own loops are
+/// p * 8 + slot, so a session from before parts (one part) reads the same.
 struct SessionManifest: Codable {
     struct Loop: Codable {
-        var slot: Int
+        var slot: Int          // loop ID
         var gain: Float
+        var shared: Bool?
         var file: String?      // audio loops
         var samples: Int64?    // loop length at `sampleRate`
         var instrument: String?   // MIDI loops: instrument name
@@ -23,6 +27,14 @@ struct SessionManifest: Codable {
     var bars: Int?             // bars in the base loop (tempo); nil = guessed again on load
     var selectedLoop: Int
     var loops: [Loop]
+    var parts: [Part]?         // nil: one part, its slots playing loops 1-8
+    var part: Int?             // the part that was playing
+
+    struct Part: Codable {
+        var index: Int
+        var name: String
+        var loops: [Int]       // loop ID in each slot
+    }
 
     static let fileName = "session.json"
 }
@@ -195,10 +207,11 @@ extension LooperModel {
         Task { await open(url) }
     }
 
-    /// Empties every loop. The next save asks for a new name.
+    /// Empties every loop and part. The next save asks for a new name.
     func newSession() {
         guard let engine, !sessionBusy else { return }
-        for loop in 0..<Int(ROUNDS_MAX_LOOPS) { rounds_engine_send(engine, Int32(loop), ROUNDS_CMD_CLEAR, -1) }
+        rounds_engine_reset(engine)
+        partNames = Self.defaultPartNames
         sessionURL = nil
         append("Session", "New session")
     }
@@ -211,28 +224,40 @@ extension LooperModel {
         append("Session", "Saving \(name)…")
 
         let capacity = rounds_engine_max_loop_samples(engine)
-        var manifest = SessionManifest(sampleRate: sampleRate, baseLoop: baseLoop, bars: bars > 0 ? bars : nil,
-                                       selectedLoop: selectedLoop, loops: [])
+        var status = RoundsStatus()
+        rounds_engine_get_status(engine, &status)
+        var manifest = SessionManifest(sampleRate: sampleRate, baseLoop: Int(status.baseLoopID), bars: bars > 0 ? bars : nil,
+                                       selectedLoop: selectedLoop, loops: [], parts: [], part: currentPart)
+        // Every loop some part plays, each once (a shared loop is in several).
+        var ids: [Int] = []
+        for part in parts where part.exists {
+            let slots = (0..<Int(ROUNDS_MAX_LOOPS)).map { Int(rounds_engine_part_loop(engine, Int32(part.id), Int32($0))) }
+            manifest.parts?.append(SessionManifest.Part(index: part.id, name: partNames[part.id], loops: slots))
+            ids += slots.filter { !ids.contains($0) }
+        }
         var audio: [Int: [Float]] = [:]
         var midiSaved: Set<Int> = []
         let noteCapacity = rounds_engine_max_notes(engine)
-        for loop in loops {
-            var entry = SessionManifest.Loop(slot: loop.id, gain: loop.gain)
+        for id in ids {
+            var loop = RoundsLoopStatus()
+            rounds_engine_get_pool_loop_status(engine, Int32(id), &loop)
+            let name = loopName(id)
+            var entry = SessionManifest.Loop(slot: id, gain: loop.gain, shared: loop.shared != 0 ? true : nil)
             defer { manifest.loops.append(entry) }
-            switch loop.state {
+            switch LoopState(rawValue: loop.state) ?? .empty {
             case .empty: continue
             case .recording:
-                append("Session", "Loop \(loop.id + 1) is still recording, so it wasn't saved")
+                append("Session", "\(name) is still recording, so it wasn't saved")
                 continue
             default: break
             }
-            guard rounds_engine_begin_export(engine, Int32(loop.id)) == 1,
+            guard rounds_engine_begin_export(engine, Int32(id)) == 1,
                   await finishTransfer(engine) == 2 else {
                 guard self.engine == engine else { return sessionFailed("Audio stopped while saving; nothing was saved.") }
-                append("Session", "Loop \(loop.id + 1) couldn't be saved (re-recorded or cleared while saving)")
+                append("Session", "\(name) couldn't be saved (re-recorded or cleared while saving)")
                 continue
             }
-            if loop.midi {
+            if loop.kind == Int32(ROUNDS_KIND_MIDI.rawValue) {
                 var notes = [RoundsNote](repeating: RoundsNote(), count: Int(noteCapacity))
                 var length: Int64 = 0
                 var instrument: Int32 = 0
@@ -243,15 +268,15 @@ extension LooperModel {
                 entry.samples = length
                 entry.instrument = (Instrument(rawValue: instrument) ?? .subBass).name
                 entry.notes = notes.prefix(Int(count)).map { [$0.start, $0.length, Int64($0.note), Int64($0.velocity)] }
-                midiSaved.insert(loop.id)
+                midiSaved.insert(id)
                 continue
             }
             var samples = [Float](repeating: 0, count: Int(capacity))
             let length = samples.withUnsafeMutableBufferPointer { rounds_engine_take_export(engine, $0.baseAddress, capacity) }
             guard length > 0 else { continue }
             samples.removeSubrange(Int(length)...)
-            audio[loop.id] = samples
-            entry.file = "loop-\(loop.id + 1).wav"
+            audio[id] = samples
+            entry.file = "loop-\(id + 1).wav"
             entry.samples = length
         }
         let saved = Set(audio.keys).union(midiSaved)
@@ -297,12 +322,20 @@ extension LooperModel {
             append("Session", String(format: "Saved at %.0f Hz, converting to %.0f Hz", manifest.sampleRate, rate))
         }
 
-        // The base loop loads first so it becomes the base again.
-        for loop in 0..<Int(ROUNDS_MAX_LOOPS) { rounds_engine_send(engine, Int32(loop), ROUNDS_CMD_CLEAR, -1) }
+        // Parts first, then the loops: the base loop first so it becomes the base again.
+        rounds_engine_reset(engine)
+        partNames = Self.defaultPartNames
+        for part in manifest.parts ?? [] where part.index >= 0 && part.index < Int(ROUNDS_MAX_PARTS) {
+            for (slot, id) in part.loops.enumerated() where slot < Int(ROUNDS_MAX_LOOPS) && Self.validLoopID(id) {
+                rounds_engine_set_part_loop(engine, Int32(part.index), Int32(slot), Int32(id))
+            }
+            partNames[part.index] = part.name
+        }
         let slots = Set(audio.keys).union(midi.keys)
         let order = slots.sorted { a, b in a == manifest.baseLoop || (b != manifest.baseLoop && a < b) }
         var loaded = 0
         for slot in order {
+            let name = loopName(slot)
             if let loop = midi[slot] {
                 let started = loop.notes.withUnsafeBufferPointer {
                     rounds_engine_begin_import_notes(engine, Int32(slot), $0.baseAddress, Int32(loop.notes.count),
@@ -310,7 +343,7 @@ extension LooperModel {
                 }
                 guard started == 1, await finishTransfer(engine) == 2 else {
                     guard self.engine == engine else { return sessionFailed("Audio stopped while opening \(name).") }
-                    append("Session", "Loop \(slot + 1) couldn't be loaded")
+                    append("Session", "\(name) couldn't be loaded")
                     continue
                 }
                 loaded += 1
@@ -318,7 +351,7 @@ extension LooperModel {
             }
             guard let samples = audio[slot] else { continue }
             guard Int64(samples.count) <= capacity else {
-                append("Session", "Loop \(slot + 1) is longer than Rounds' \(Int(maxLoopSeconds)) s limit and wasn't loaded")
+                append("Session", "\(name) is longer than Rounds' \(Int(maxLoopSeconds)) s limit and wasn't loaded")
                 continue
             }
             let started = samples.withUnsafeBufferPointer {
@@ -326,19 +359,33 @@ extension LooperModel {
             }
             guard started == 1, await finishTransfer(engine) == 2 else {
                 guard self.engine == engine else { return sessionFailed("Audio stopped while opening \(name).") }
-                append("Session", "Loop \(slot + 1) couldn't be loaded")
+                append("Session", "\(name) couldn't be loaded")
                 continue
             }
             loaded += 1
         }
-        for loop in manifest.loops where loop.slot >= 0 && loop.slot < Int(ROUNDS_MAX_LOOPS) {
-            setGain(loop.slot, loop.gain)
+        for loop in manifest.loops where Self.validLoopID(loop.slot) {
+            rounds_engine_set_loop_gain(engine, Int32(loop.slot), loop.gain)
+            if loop.shared == true { rounds_engine_set_shared(engine, Int32(loop.slot), 1) }
         }
+        knobsLetGo()
+        if let part = manifest.part, part > 0, part < Int(ROUNDS_MAX_PARTS) { rounds_engine_switch_part(engine, Int32(part)) }
         if let savedBars = manifest.bars { setBars(savedBars) }
         if manifest.selectedLoop >= 0 && manifest.selectedLoop < Int(ROUNDS_MAX_LOOPS) { selectedLoop = manifest.selectedLoop }
         sessionURL = url
         sessionMessage = nil
-        append("Session", "Opened \(name): \(loaded) loop\(loaded == 1 ? "" : "s"), stopped. Tap a loop to start.")
+        let partCount = manifest.parts?.count ?? 1
+        append("Session", "Opened \(name): \(loaded) loop\(loaded == 1 ? "" : "s") in \(partCount) part\(partCount == 1 ? "" : "s"), "
+               + "stopped. Tap a loop to start.")
+    }
+
+    nonisolated static func validLoopID(_ id: Int) -> Bool { id >= 0 && id < Int(ROUNDS_POOL_LOOPS) }
+
+    /// "Loop 3", or "Chorus loop 3" for a loop that only another part plays.
+    private func loopName(_ id: Int) -> String {
+        let part = id / Int(ROUNDS_MAX_LOOPS)
+        let slot = id % Int(ROUNDS_MAX_LOOPS)
+        return part == 0 ? "Loop \(slot + 1)" : "\(partNames[part]) loop \(slot + 1)"
     }
 
     /// Reads every loop's WAV, converted to `sampleRate` and set to its exact
@@ -351,7 +398,7 @@ extension LooperModel {
         var audio: [Int: [Float]] = [:]
         for loop in manifest.loops {
             guard let file = loop.file, let samples = loop.samples, samples > 0,
-                  loop.slot >= 0 && loop.slot < Int(ROUNDS_MAX_LOOPS) else { continue }
+                  validLoopID(loop.slot) else { continue }
             var length = samples
             if ratio != 1 {
                 if let baseSamples, let newBase {
@@ -387,7 +434,7 @@ extension LooperModel {
         var result: [Int: MIDILoop] = [:]
         for loop in manifest.loops {
             guard let notes = loop.notes, let samples = loop.samples, samples > 1,
-                  loop.slot >= 0 && loop.slot < Int(ROUNDS_MAX_LOOPS) else { continue }
+                  validLoopID(loop.slot) else { continue }
             var length = samples
             if ratio != 1 {
                 if let baseSamples, let newBase {

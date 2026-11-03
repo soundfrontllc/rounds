@@ -13,12 +13,25 @@ int64_t wrap(int64_t value, int64_t length) {
 }
 }  // namespace
 
-Looper::Looper(const Config& config) : config_(config) {
+LayerPool::LayerPool(int count, int64_t samples) {
+    layers.resize(static_cast<size_t>(count));
+    for (auto& layer : layers) layer.buffer.assign(static_cast<size_t>(samples), 0.0f);
+}
+
+int LayerPool::freeCount() const {
+    int count = 0;
+    for (const auto& layer : layers) count += layer.inUse ? 0 : 1;
+    return count;
+}
+
+Looper::Looper(const Config& config, LayerPool* pool) : config_(config), pool_(pool) {
     base_.assign(static_cast<size_t>(config_.maxLoopSamples + config_.crossfadeSamples), 0.0f);
-    // Two spare slots: one for a new layer while the oldest is being merged.
-    layers_.resize(static_cast<size_t>(config_.maxUndoLayers + 2));
-    for (auto& layer : layers_) layer.buffer.assign(static_cast<size_t>(config_.maxLoopSamples), 0.0f);
-    order_.reserve(layers_.size());
+    if (!pool_) {
+        // Two spare slots: one for a new layer while the oldest is being merged.
+        ownPool_ = std::make_unique<LayerPool>(config_.maxUndoLayers + 2, config_.maxLoopSamples);
+        pool_ = ownPool_.get();
+    }
+    order_.reserve(static_cast<size_t>(config_.maxUndoLayers + 2));
     history_.assign(static_cast<size_t>(std::max(1, config_.historySamples)), 0.0f);
     notes_.resize(static_cast<size_t>(std::max(1, config_.maxNotes)));
 }
@@ -154,7 +167,7 @@ void Looper::clear() {
     baseWriting_ = false;
     baseWritten_ = 0;
     loopLength_ = 0;
-    for (auto& layer : layers_) layer.inUse = false;
+    for (int slot : order_) layer(slot).inUse = false;
     order_.clear();
     openLayer_ = -1;
     flattenSlot_ = -1;
@@ -217,8 +230,8 @@ int64_t Looper::snapLength(int64_t recorded, int64_t minimum) const {
 }
 
 int Looper::freeSlot() const {
-    for (size_t i = 0; i < layers_.size(); i++) {
-        if (!layers_[i].inUse) return static_cast<int>(i);
+    for (size_t i = 0; i < pool_->layers.size(); i++) {
+        if (!pool_->layers[i].inUse) return static_cast<int>(i);
     }
     return -1;
 }
@@ -230,18 +243,24 @@ int Looper::openLayer() {
     }
     int slot = freeSlot();
     if (slot < 0) {
-        // Only possible if layers are opened faster than they can be merged.
+        // Layers opened faster than they can be merged (or a shared pool ran
+        // dry): merge this loop's oldest at once.
+        if (flattenSlot_ < 0 && !order_.empty()) {
+            flattenSlot_ = order_.front();
+            flattenPos_ = 0;
+        }
         while (flattenSlot_ >= 0) stepFlatten();
         slot = freeSlot();
         if (slot < 0) return -1;
     }
-    Layer& layer = layers_[static_cast<size_t>(slot)];
-    layer.inUse = true;
-    layer.startS = clock_;
-    layer.closeS = INT64_MAX;
-    layer.openIndex = wrap(clock_ - origin_, loopLength_);
-    layer.written = 0;
-    layer.writing = true;
+    Layer& l = layer(slot);
+    l.inUse = true;
+    l.age = ++pool_->counter;
+    l.startS = clock_;
+    l.closeS = INT64_MAX;
+    l.openIndex = wrap(clock_ - origin_, loopLength_);
+    l.written = 0;
+    l.writing = true;
     order_.push_back(slot);
     openLayer_ = slot;
     if (kind_ == Kind::Midi) replayRecent(clock_, slot);
@@ -250,14 +269,14 @@ int Looper::openLayer() {
 
 void Looper::closeLayer() {
     if (openLayer_ < 0) return;
-    layers_[static_cast<size_t>(openLayer_)].closeS = clock_;
+    layer(openLayer_).closeS = clock_;
     openLayer_ = -1;
 }
 
 void Looper::discardLayer(int slot) {
     if (slot < 0) return;
     if (slot == flattenSlot_) flattenSlot_ = -1;  // cannot happen for the open layer, but stay safe
-    layers_[static_cast<size_t>(slot)].inUse = false;
+    layer(slot).inUse = false;
     order_.erase(std::remove(order_.begin(), order_.end(), slot), order_.end());
     if (slot == openLayer_) openLayer_ = -1;
     removeNotes(slot);
@@ -276,9 +295,49 @@ void Looper::removeLastClosedLayer() {
 // punch-out tail is cut short so it doesn't write against the new origin.
 void Looper::finishPendingWrites() {
     if (baseWriting_ && loopLength_ > 0) baseWriting_ = false;
-    for (auto& layer : layers_) {
-        if (layer.inUse) layer.writing = false;
+    for (int slot : order_) layer(slot).writing = false;
+}
+
+// ---------------------------------------------------------------------------
+// Shared layer pool
+
+uint64_t Looper::oldestLayerAge() const {
+    if (flattenSlot_ >= 0 || order_.empty() || order_.front() == openLayer_) return 0;
+    return layer(order_.front()).age;
+}
+
+void Looper::mergeOldestLayer() {
+    if (oldestLayerAge() == 0) return;
+    flattenSlot_ = order_.front();
+    flattenPos_ = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Copying (a new part)
+
+void Looper::copySlice(const Looper& source, int64_t offset, int64_t count) {
+    if (offset == 0) clear();
+    count = std::min(count, config_.maxLoopSamples - offset);
+    for (int64_t k = 0; k < count; k++) {
+        base_[static_cast<size_t>(offset + k)] = source.readLoop(offset + k);
     }
+}
+
+void Looper::finishCopy(const Looper& source) {
+    clear();  // keeps base_
+    loopLength_ = std::min(source.loopLength_, config_.maxLoopSamples);
+    origin_ = source.origin_;
+    barLength_ = source.barLength_;
+    kind_ = source.kind_;
+    if (kind_ == Kind::Midi) {
+        for (int i = 0; i < source.noteCount_ && noteCount_ < config_.maxNotes; i++) {
+            Note n = source.notes_[static_cast<size_t>(i)];
+            if (n.length < 0) n.length = std::max<int64_t>(1, loopLength_ / 16);  // still held
+            n.layer = -1;
+            notes_[static_cast<size_t>(noteCount_++)] = n;
+        }
+    }
+    state_ = source.state_ == State::Stopped ? State::Stopped : State::Playing;
 }
 
 // ---------------------------------------------------------------------------
@@ -437,7 +496,7 @@ void Looper::writeInput(float sample, int64_t s) {
     if (loopLength_ == 0) return;
 
     for (int slot : order_) {
-        Layer& layer = layers_[static_cast<size_t>(slot)];
+        Layer& layer = this->layer(slot);
         if (!layer.writing || s < layer.startS) continue;
         float gain = std::min(1.0f, static_cast<float>(layer.written) / static_cast<float>(fade));
         if (s >= layer.closeS) {
@@ -470,7 +529,7 @@ float Looper::readLoop(int64_t index) const {
     for (size_t i = 0; i < order_.size(); i++) {
         const int slot = order_[i];
         if (slot == flattenSlot_ && index < flattenPos_) continue;  // already merged into base
-        const Layer& layer = layers_[static_cast<size_t>(slot)];
+        const Layer& layer = this->layer(slot);
         if (layerCovers(layer, index)) sum += layer.buffer[static_cast<size_t>(index)];
     }
     return sum;
@@ -478,7 +537,7 @@ float Looper::readLoop(int64_t index) const {
 
 void Looper::stepFlatten() {
     if (flattenSlot_ < 0) return;
-    Layer& layer = layers_[static_cast<size_t>(flattenSlot_)];
+    Layer& layer = this->layer(flattenSlot_);
     if (kind_ == Kind::Midi) {
         // Notes merge at once: they just join the base.
         for (int i = 0; i < noteCount_; i++) {
@@ -512,7 +571,7 @@ void Looper::process(const float* in, float* out, int frames, float gain) {
 
     stepFlatten();
 
-    const bool audible = state_ == State::Playing || state_ == State::Overdubbing;
+    const bool audible = out && (state_ == State::Playing || state_ == State::Overdubbing);
     for (int i = 0; i < frames; i++) {
         const int64_t c = clock_ + i;
         writeInput(in[i], c - inputLatency_);

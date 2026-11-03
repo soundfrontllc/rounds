@@ -1118,6 +1118,203 @@ static void testInstruments() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Parts (milestone 5)
+
+static RoundsLoopStatus poolStatus(Engine& engine, int id) {
+    RoundsLoopStatus s;
+    engine.getPoolLoopStatus(id, &s);
+    return s;
+}
+
+static RoundsPartStatus partStatus(Engine& engine, int part) {
+    RoundsPartStatus s;
+    engine.getPartStatus(part, &s);
+    return s;
+}
+
+static void testPartSwitchTiming() {
+    std::printf("Parts: a switch lands where the longest loop comes round, sample-exact\n");
+    const int in = 200, outLat = 300;
+    Keys k(in, outLat);
+    const int64_t L = 48000;
+    // Slot 1: a rim at 1000 (shared). Slot 2: a hat at 6000, recorded 24000 later.
+    const int64_t start = 10000 + 128;
+    k.tap(0, 10000);
+    k.note(0, ROUNDS_INSTRUMENT_DRY_KIT, 37, 110, start + 1000);
+    k.note(0, ROUNDS_INSTRUMENT_DRY_KIT, 37, 0, start + 2000);
+    k.tap(0, start + L - 128);
+    const int64_t start2 = start + L + 24000;
+    k.tap(1, start2 - 128);
+    k.note(1, ROUNDS_INSTRUMENT_DRY_KIT, 42, 100, start2 + 6000);
+    k.note(1, ROUNDS_INSTRUMENT_DRY_KIT, 42, 0, start2 + 7000);
+    k.tap(1, start2 + L - 128);
+    k.run(256);
+    CHECK(k.s(0).loopLength == L && k.s(1).loopLength == L, "two 1-bar loops");
+    k.engine.setShared(0, true);
+    k.runTo(start2 + L + 20000);
+    const int64_t applied = k.now;
+    k.engine.newPart();
+    k.run(128);
+    const int64_t R = start + ((applied + outLat - start + L - 1) / L) * L;  // next time the rim loop comes round
+    CHECK(status(k.engine).nextPart == 1, "new part waits for the end of the cycle");
+    CHECK(status(k.engine).partSwitchIn == R - (k.now + outLat), "heard in %lld samples (expected %lld)",
+          (long long)status(k.engine).partSwitchIn, (long long)(R - (k.now + outLat)));
+    CHECK(partStatus(k.engine, 1).exists == 1 && partStatus(k.engine, 1).loops == 2, "part 2 has both loops");
+    k.runTo(R + 3 * L);
+    CHECK(status(k.engine).part == 1 && status(k.engine).nextPart == -1, "switched to part 2");
+    CHECK(k.s(0).loopID == 0 && k.s(1).loopID == 9, "slot 1 shared (loop %d), slot 2 copied (loop %d)", k.s(0).loopID,
+          k.s(1).loopID);
+    // What is written at clock c is heard at c + outLat.
+    for (int64_t cycle = -1; cycle <= 1; cycle++) {
+        const int64_t rim = R + cycle * L + 1000 - outLat;
+        CHECK(k.onset(rim - 500, rim + 500) == rim, "rim plays straight through (cycle %lld, off by %lld)",
+              (long long)cycle, (long long)(k.onset(rim - 500, rim + 500) - rim));
+    }
+    const int64_t oldHat = R - L + 30000 - outLat;  // the hat loop started 24000 into the rim's cycle
+    CHECK(k.onset(oldHat - 500, oldHat + 500) == oldHat, "old hat before the switch");
+    for (int64_t cycle = 0; cycle <= 1; cycle++) {
+        const int64_t hat = R + cycle * L + 6000 - outLat;
+        CHECK(k.onset(hat - 500, hat + 500) == hat, "copied hat starts from its top at the switch (off by %lld)",
+              (long long)(k.onset(hat - 500, hat + 500) - hat));
+        CHECK(k.peak(oldHat + (cycle + 1) * L, oldHat + (cycle + 1) * L + 500) < 0.02f, "old part's hat is silent");
+    }
+
+    // Back to part 1: asking twice takes it back; asking again queues it.
+    k.engine.switchPart(0);
+    k.run(128);
+    CHECK(status(k.engine).nextPart == 0, "queued");
+    k.engine.switchPart(0);
+    k.run(128);
+    CHECK(status(k.engine).nextPart == -1, "asking again takes it back");
+    const int64_t applied2 = k.now;
+    k.engine.switchPart(0);
+    k.run(128);
+    const int64_t R2 = start + ((applied2 + outLat - start + L - 1) / L) * L;
+    k.runTo(R2 + 2 * L);
+    CHECK(status(k.engine).part == 0, "back in part 1");
+    const int64_t hat = R2 + 6000 - outLat;
+    CHECK(k.onset(hat - 500, hat + 500) == hat, "part 1's hat restarts from its top (off by %lld)",
+          (long long)(k.onset(hat - 500, hat + 500) - hat));
+}
+
+static void testNewPartCopiesAudio() {
+    std::printf("Parts: a new part copies audio loops (overdubs merged) and keeps shared ones\n");
+    const int64_t L = 48000;
+    Rig r;
+    auto tap = [&r](int slot) {
+        r.engine.send(slot, ROUNDS_CMD_TAP, -1);
+        const int64_t at = r.now;
+        r.run(128);
+        return at;
+    };
+    const int64_t t0 = tap(0);
+    r.clicks = {t0 + 1000, t0 + 2 * L + 20000};
+    r.run(L - 128);
+    tap(0);                       // a 1-bar loop with a click at 1000
+    r.run(L - 128);
+    tap(0);                       // overdub...
+    r.run(L / 2);
+    tap(0);                       // ...with a click at 20000
+    CHECK(r.engine.transferStatus() == 0 && loopStatus(r.engine, 0).layers == 1, "one overdub layer");
+    r.run(L / 2 + 30000);
+    const int64_t t1 = tap(1);
+    r.clicks.push_back(t1 + 5000);
+    r.run(L - 128);
+    tap(1);
+    r.engine.setShared(1, true);
+    r.run(10000);
+    const int64_t applied = r.now;
+    r.engine.newPart();
+    r.run(128);
+    const int64_t R = t0 + ((applied - t0 + L - 1) / L) * L;
+    r.run(R + 2 * L - r.now);
+    CHECK(status(r.engine).part == 1, "switched");
+    const RoundsLoopStatus copy = loopStatus(r.engine, 0);
+    CHECK(copy.loopID == 8 && copy.layers == 0 && copy.state == ROUNDS_LOOP_PLAYING && copy.loopLength == L,
+          "slot 1 is a copy (loop %d, %d layers, state %d)", copy.loopID, copy.layers, copy.state);
+    CHECK(loopStatus(r.engine, 1).loopID == 1 && loopStatus(r.engine, 1).shared == 1, "slot 2 is the shared loop");
+    const std::vector<int64_t> after = r.onsets(R, R + L);
+    const std::vector<int64_t> want = {R + 1000, R + 20000, R + mod(t1 + 5000 - t0, L)};
+    CHECK(after == want, "copy plays base and overdub, shared loop in step (%zu onsets)", after.size());
+
+    r.engine.send(0, ROUNDS_CMD_CLEAR, -1);
+    r.run(128);
+    CHECK(poolStatus(r.engine, 0).state == ROUNDS_LOOP_PLAYING && poolStatus(r.engine, 0).layers == 1,
+          "clearing the copy leaves part 1's loop alone");
+    r.engine.send(1, ROUNDS_CMD_CLEAR, -1);
+    r.run(128);
+    CHECK(poolStatus(r.engine, 1).state == ROUNDS_LOOP_EMPTY && partStatus(r.engine, 0).loops == 1,
+          "clearing a shared loop clears it in every part");
+}
+
+static void testPartSwitchClosesAndStops() {
+    std::printf("Parts: leaving a part closes its overdubs; with nothing playing a switch is immediate\n");
+    Driver d;
+    d.send(ROUNDS_CMD_TAP);
+    d.advance(48000 - 128);
+    d.send(ROUNDS_CMD_TAP);
+    d.engine.newPart();
+    d.advance(128);
+    CHECK(status(d.engine).nextPart == 1, "new part queued");
+    d.send(ROUNDS_CMD_TAP);
+    CHECK(d.s().state == ROUNDS_LOOP_OVERDUBBING, "overdubbing in part 1");
+    d.advance(48000);
+    CHECK(status(d.engine).part == 1, "switched");
+    CHECK(poolStatus(d.engine, 0).state == ROUNDS_LOOP_PLAYING && poolStatus(d.engine, 0).layers == 1,
+          "the overdub closed at the switch (state %d, %d layers)", poolStatus(d.engine, 0).state,
+          poolStatus(d.engine, 0).layers);
+    d.engine.send(-1, ROUNDS_CMD_START_STOP_ALL, -1);
+    d.advance(128);
+    CHECK(d.s().state == ROUNDS_LOOP_STOPPED, "part 2 stopped");
+    d.engine.switchPart(0);
+    d.advance(128);
+    CHECK(status(d.engine).part == 0 && status(d.engine).nextPart == -1, "switch with nothing playing is immediate");
+    CHECK(d.s().state == ROUNDS_LOOP_STOPPED, "and leaves the part stopped");
+    d.engine.switchPart(5);
+    d.advance(128);
+    CHECK(status(d.engine).part == 0 && status(d.engine).nextPart == -1, "a part that doesn't exist is ignored");
+}
+
+static void testSharedLayerPool() {
+    std::printf("Parts: 32 overdubs on 8 loops share 24 layers, merging the oldest\n");
+    Driver d;
+    for (int slot = 0; slot < 8; slot++) {
+        d.send(ROUNDS_CMD_TAP, slot);
+        d.advance(9600 - 128);
+        d.send(ROUNDS_CMD_TAP, slot);
+    }
+    bool allOpened = true;
+    for (int round = 0; round < 4; round++) {
+        for (int slot = 0; slot < 8; slot++) {
+            d.send(ROUNDS_CMD_TAP, slot);
+            allOpened = allOpened && d.s(slot).layerOpen == 1;
+            d.advance(2000);
+            d.send(ROUNDS_CMD_TAP, slot);
+            d.advance(512);
+        }
+    }
+    int layers = 0;
+    for (int slot = 0; slot < 8; slot++) layers += d.s(slot).layers;
+    CHECK(allOpened, "every overdub got a layer");
+    CHECK(layers <= Engine::kLayers - 3 && d.s(0).layers < 4, "%d layers kept, loop 1 has %d", layers, d.s(0).layers);
+}
+
+static void testSessionParts() {
+    std::printf("Parts: reset and set_part_loop rebuild a session's parts\n");
+    Driver d;
+    d.send(ROUNDS_CMD_TAP);
+    d.advance(48000 - 128);
+    d.send(ROUNDS_CMD_TAP);
+    d.engine.reset();
+    d.advance(128);
+    CHECK(d.s().state == ROUNDS_LOOP_EMPTY && partStatus(d.engine, 1).exists == 0, "reset empties everything");
+    d.engine.setPartLoop(2, 3, 5);
+    d.advance(128);
+    CHECK(partStatus(d.engine, 2).exists == 1 && d.engine.partLoop(2, 3) == 5 && d.engine.partLoop(2, 0) == 16,
+          "part 3 made, slot 4 plays loop 6");
+}
+
 int main() {
     testRecordAndPlaybackAlignment();
     testOverdubAlignment();
@@ -1145,6 +1342,11 @@ int main() {
     testMidiQuantizedRecording();
     testStoppedMidiLetsGo();
     testInstruments();
+    testPartSwitchTiming();
+    testNewPartCopiesAudio();
+    testPartSwitchClosesAndStops();
+    testSharedLayerPool();
+    testSessionParts();
     std::printf("\n%d checks, %d failed\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

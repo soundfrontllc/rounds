@@ -25,6 +25,14 @@ typedef struct RoundsEngine RoundsEngine;
 // 80-160 BPM); later loops snap to 1, 2, 4, 8 ... bars so they stay in step.
 #define ROUNDS_MAX_LOOPS 8
 
+// Parts (Verse, Chorus ...): each part has the 8 slots, and each slot points
+// at one of the engine's loops (loop IDs 0 ..< ROUNDS_POOL_LOOPS; part p's
+// own loops are p * 8 + slot). A shared loop is one loop in several parts.
+// Commands, notes and loop status take a slot of the current part; gains,
+// sharing and session transfers take a loop ID.
+#define ROUNDS_MAX_PARTS 8
+#define ROUNDS_POOL_LOOPS 64  // ROUNDS_MAX_LOOPS * ROUNDS_MAX_PARTS (a plain number so Swift imports it)
+
 typedef enum {
     ROUNDS_LOOP_EMPTY = 0,
     ROUNDS_LOOP_RECORDING = 1,
@@ -57,6 +65,10 @@ typedef enum {
     ROUNDS_EVENT_CALIBRATION_DONE = 3,// value = measured round trip in samples (-1 = failed)
     ROUNDS_EVENT_QUEUE_FULL = 4,      // a command was dropped
     ROUNDS_EVENT_QUEUED = 5,          // value = RoundsQueued: waiting for the next bar
+    // Parts (loop = -1).
+    ROUNDS_EVENT_PART_CHANGED = 6,    // value = the part now playing
+    ROUNDS_EVENT_PART_QUEUED = 7,     // value = part waiting for the end of the cycle, -1 = taken back
+    ROUNDS_EVENT_PART_CREATED = 8,    // value = new part, -1 = all 8 parts are used
 } RoundsEventType;
 
 // With quantize on and something playing, record, play and stop wait for the
@@ -115,11 +127,20 @@ typedef struct {
     int32_t kind;           // RoundsLoopKind (audio until notes are recorded)
     int32_t instrument;     // RoundsInstrument the slot plays
     int32_t notes;          // recorded notes (MIDI loops)
+    int32_t loopID;         // the engine loop this slot plays
+    int32_t shared;         // 1: "New part" keeps this loop instead of copying it
 } RoundsLoopStatus;
 
 typedef struct {
+    int32_t exists;
+    int32_t loops;          // slots with a loop that isn't empty
+    int64_t cycleLength;    // longest loop in the part, samples
+} RoundsPartStatus;
+
+typedef struct {
     int64_t baseLength;     // samples; 0 until the first loop is recorded
-    int32_t baseLoop;       // slot that set the base length, -1 if none
+    int32_t baseLoop;       // slot that set the base length, -1 if none (or in another part)
+    int32_t baseLoopID;     // loop ID that set it, -1 if none
     int32_t bars;           // bars in the base loop (4/4), 0 = no tempo yet
     int64_t barLength;      // samples; tempo = 240 * sampleRate / barLength BPM
     int64_t cycleLength;    // longest loop, samples
@@ -132,6 +153,9 @@ typedef struct {
     int32_t calibrating;
     int64_t sampleTime;     // engine sample clock
     double sampleRate;
+    int32_t part;           // the part playing
+    int32_t nextPart;       // part waiting for the end of the cycle, -1 if none
+    int64_t partSwitchIn;   // samples until it is heard, -1 if none
 } RoundsStatus;
 
 // maxLoopSeconds bounds memory per loop slot: all loop and layer buffers are
@@ -161,7 +185,8 @@ int32_t rounds_engine_send_at_host_time(RoundsEngine* engine, int32_t loop, Roun
 void rounds_engine_set_latency(RoundsEngine* engine, int32_t inputLatency, int32_t outputLatency);
 // Gain for passing the input straight to the output (0 = off).
 void rounds_engine_set_monitor_gain(RoundsEngine* engine, float gain);
-void rounds_engine_set_loop_gain(RoundsEngine* engine, int32_t loop, float gain);
+// Volume of a loop ID (it goes with the loop into every part that shares it).
+void rounds_engine_set_loop_gain(RoundsEngine* engine, int32_t loopID, float gain);
 // Quantize record/play/stop to the next bar (off by default in the engine).
 void rounds_engine_set_quantize(RoundsEngine* engine, int32_t on);
 // Click on every beat while anything plays (0 = off, the default).
@@ -181,30 +206,52 @@ int32_t rounds_engine_note(RoundsEngine* engine, int32_t loop, int32_t instrumen
 // The slot's instrument (switches a MIDI loop's sound).
 void rounds_engine_set_instrument(RoundsEngine* engine, int32_t loop, int32_t instrument);
 
+// Parts. A switch waits for the end of the current cycle (the longest loop in
+// the playing part coming round); with nothing playing it happens at once and
+// leaves the part's loops stopped. Asking for the playing or the waiting part
+// takes a waiting switch back. Loops only in the old part close any recording
+// or overdub at the switch and fall silent, keeping their state; loops only in
+// the new part start from their top; shared loops play straight through.
+void rounds_engine_switch_part(RoundsEngine* engine, int32_t part);
+// Copies the playing part into the first unused part (shared loops are kept,
+// the others copied with their overdubs merged) and switches to it like
+// switch_part. Emits ROUNDS_EVENT_PART_CREATED.
+void rounds_engine_new_part(RoundsEngine* engine);
+void rounds_engine_set_shared(RoundsEngine* engine, int32_t loopID, int32_t shared);
+void rounds_engine_get_part_status(RoundsEngine* engine, int32_t part, RoundsPartStatus* out);
+// The loop ID in a part's slot (as of the last processed block).
+int32_t rounds_engine_part_loop(RoundsEngine* engine, int32_t part, int32_t slot);
+// Session load: empties every loop and leaves only part 1, with its own loops;
+// then set_part_loop makes the saved parts (creating them) before loading loops.
+void rounds_engine_reset(RoundsEngine* engine);
+void rounds_engine_set_part_loop(RoundsEngine* engine, int32_t part, int32_t slot, int32_t loopID);
+
 // Play clicks and measure how long they take to come back in. Needs the
 // output physically looped back to the input (a cable), or a mic near the speaker.
 void rounds_engine_start_calibration(RoundsEngine* engine);
 
 void rounds_engine_get_status(RoundsEngine* engine, RoundsStatus* out);
+// A slot of the playing part.
 void rounds_engine_get_loop_status(RoundsEngine* engine, int32_t loop, RoundsLoopStatus* out);
+void rounds_engine_get_pool_loop_status(RoundsEngine* engine, int32_t loopID, RoundsLoopStatus* out);
 // Returns 1 and fills `out` if an event was waiting.
 int32_t rounds_engine_poll_event(RoundsEngine* engine, RoundsEvent* out);
 
-// Session save/load. One loop at a time; the audio thread copies a slice per
+// Session save/load, by loop ID. One loop at a time; the audio thread copies a slice per
 // block, so a save or load never glitches playback. Poll transfer_status
 // until it is no longer 1 (it needs the audio running).
 //
-// Save: begin_export(loop), wait for 2, then take_export(dest, capacity)
+// Save: begin_export(loopID), wait for 2, then take_export(dest, capacity)
 // returns the loop's length in samples (-1 on failure). Saved loops are
 // rotated to line up with the base loop's start, so loops saved together
 // play back in step.
-// Load: begin_import(loop, samples, length) copies the samples right away;
+// Load: begin_import(loopID, samples, length) copies the samples right away;
 // the loop then fills in and ends up stopped. Load the base loop first: the
 // first loop to finish loading into an empty engine becomes the base.
 // Every loaded loop starts at index 0 together, so tapping one starts them in step.
 int64_t rounds_engine_max_loop_samples(RoundsEngine* engine);
-int32_t rounds_engine_begin_export(RoundsEngine* engine, int32_t loop);
-int32_t rounds_engine_begin_import(RoundsEngine* engine, int32_t loop, const float* samples, int64_t length);
+int32_t rounds_engine_begin_export(RoundsEngine* engine, int32_t loopID);
+int32_t rounds_engine_begin_import(RoundsEngine* engine, int32_t loopID, const float* samples, int64_t length);
 // 0 = idle, 1 = in progress, 2 = done, -1 = failed (loop empty, recording, or
 // re-recorded mid-save). Reading 2 after an import, or -1, frees the engine
 // for the next transfer.
@@ -216,7 +263,7 @@ int64_t rounds_engine_take_export(RoundsEngine* engine, float* dest, int64_t cap
 int32_t rounds_engine_take_export_notes(RoundsEngine* engine, RoundsNote* dest, int32_t capacity, int64_t* length,
                                         int32_t* instrument);
 // Loads a MIDI loop; finishes like begin_import (poll transfer_status).
-int32_t rounds_engine_begin_import_notes(RoundsEngine* engine, int32_t loop, const RoundsNote* notes, int32_t count,
+int32_t rounds_engine_begin_import_notes(RoundsEngine* engine, int32_t loopID, const RoundsNote* notes, int32_t count,
                                          int64_t length, int32_t instrument);
 int32_t rounds_engine_max_notes(RoundsEngine* engine);
 

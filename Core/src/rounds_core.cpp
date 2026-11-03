@@ -71,6 +71,32 @@ void rounds_engine_get_loop_status(RoundsEngine* engine, int32_t loop, RoundsLoo
     engine->engine.getLoopStatus(loop, out);
 }
 
+void rounds_engine_get_pool_loop_status(RoundsEngine* engine, int32_t loopID, RoundsLoopStatus* out) {
+    engine->engine.getPoolLoopStatus(loopID, out);
+}
+
+void rounds_engine_switch_part(RoundsEngine* engine, int32_t part) { engine->engine.switchPart(part); }
+
+void rounds_engine_new_part(RoundsEngine* engine) { engine->engine.newPart(); }
+
+void rounds_engine_set_shared(RoundsEngine* engine, int32_t loopID, int32_t shared) {
+    engine->engine.setShared(loopID, shared != 0);
+}
+
+void rounds_engine_get_part_status(RoundsEngine* engine, int32_t part, RoundsPartStatus* out) {
+    engine->engine.getPartStatus(part, out);
+}
+
+int32_t rounds_engine_part_loop(RoundsEngine* engine, int32_t part, int32_t slot) {
+    return engine->engine.partLoop(part, slot);
+}
+
+void rounds_engine_reset(RoundsEngine* engine) { engine->engine.reset(); }
+
+void rounds_engine_set_part_loop(RoundsEngine* engine, int32_t part, int32_t slot, int32_t loopID) {
+    engine->engine.setPartLoop(part, slot, loopID);
+}
+
 int32_t rounds_engine_poll_event(RoundsEngine* engine, RoundsEvent* out) {
     return engine->engine.pollEvent(out) ? 1 : 0;
 }

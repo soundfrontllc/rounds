@@ -45,6 +45,8 @@ struct LoopInfo: Identifiable, Equatable {
     var midi = false                 // a MIDI loop (notes), else audio
     var instrument = Instrument.subBass
     var notes = 0
+    var loopID = 0                   // the engine loop in this slot of the playing part
+    var shared = false               // "New part" keeps it instead of copying it
 
     var isDrumLoop: Bool { state != .empty && midi && instrument.isKit }
 
@@ -52,6 +54,14 @@ struct LoopInfo: Identifiable, Equatable {
     enum Queued: Int32 {
         case none, tap, stop
     }
+}
+
+/// One part (Verse, Chorus …) as the UI sees it.
+struct PartInfo: Identifiable, Equatable {
+    let id: Int
+    var exists = false
+    var loops = 0
+    var cycleBars = 0
 }
 
 /// UI-side state. Polls the engine; never touches the audio thread directly.
@@ -103,6 +113,16 @@ final class LooperModel: ObservableObject {
     @Published var lastHit: (pad: Int, velocity: Int, time: Date)?
     private var lastRoutes: (ControlRouter.NoteRoute, ControlRouter.NoteRoute)?
     @Published var loops: [LoopInfo] = (0..<Int(ROUNDS_MAX_LOOPS)).map { LoopInfo(id: $0) }
+    @Published var parts: [PartInfo] = (0..<Int(ROUNDS_MAX_PARTS)).map { PartInfo(id: $0, exists: $0 == 0) }
+    @Published var currentPart = 0
+    /// Part waiting for the end of the cycle (-1 = none), and how far off it is.
+    @Published var nextPart = -1
+    @Published var partSwitchBars: Double = 0
+    /// Saved with the session.
+    @Published var partNames = LooperModel.defaultPartNames
+    static let defaultPartNames = ["Verse", "Chorus", "Bridge", "Part 4", "Part 5", "Part 6", "Part 7", "Part 8"]
+    /// The Launchkey's Shift is held: the top pads switch parts.
+    @Published private(set) var shiftDown = false
     /// The first loop recorded sets the tempo.
     @Published var baseSeconds: Double = 0
     @Published var baseLoop = -1
@@ -149,8 +169,8 @@ final class LooperModel: ObservableObject {
     private var audio: OpaquePointer?
     private(set) var engine: OpaquePointer?
     private var pollTimer: Timer?
-    /// Per loop slot. All 8 slots' buffers (with 8 undo layers each) are
-    /// allocated when audio starts: about 1 GB at 48 kHz.
+    /// Per loop. All 64 loops (8 parts of 8 slots) and 24 shared undo layers
+    /// are allocated when audio starts: about 1 GB at 48 kHz.
     let maxLoopSeconds = 60.0
     /// The interface last started, so it is picked again when it is plugged back in.
     private var lastDeviceName: String?
@@ -346,10 +366,19 @@ final class LooperModel: ObservableObject {
         applyGain(loop, gain)
     }
 
+    /// Volume belongs to the loop in the slot, so it follows a shared loop
+    /// into other parts.
     private func applyGain(_ loop: Int, _ gain: Float) {
         gains[loop] = gain
         loops[loop].gain = gain
-        if let engine { rounds_engine_set_loop_gain(engine, Int32(loop), gain) }
+        if let engine {
+            rounds_engine_set_loop_gain(engine, rounds_engine_part_loop(engine, Int32(currentPart), Int32(loop)), gain)
+        }
+    }
+
+    /// After a part switch or a session load the knobs no longer match the loops.
+    func knobsLetGo() {
+        knobInControl = [Bool](repeating: false, count: knobInControl.count)
     }
 
     // MARK: Controls
@@ -359,6 +388,40 @@ final class LooperModel: ObservableObject {
     func undo() { router.send(ROUNDS_CMD_UNDO) }
     func stop() { router.send(ROUNDS_CMD_STOP) }
     func clear() { router.send(ROUNDS_CMD_CLEAR) }
+
+    // MARK: Parts
+
+    /// Switches at the end of the cycle; an unused part's pad makes a new part.
+    func switchPart(_ part: Int) {
+        guard let engine, part >= 0, part < parts.count else { return }
+        if parts[part].exists {
+            rounds_engine_switch_part(engine, Int32(part))
+        } else {
+            newPart()
+        }
+    }
+
+    /// Copies the playing part (keeping shared loops) and switches to the copy.
+    func newPart() {
+        guard let engine else { return }
+        rounds_engine_new_part(engine)
+    }
+
+    func setShared(_ shared: Bool) {
+        guard let engine else { return }
+        let loop = loops[selectedLoop]
+        rounds_engine_set_shared(engine, Int32(loop.loopID), shared ? 1 : 0)
+        loops[selectedLoop].shared = shared
+        append("Loop \(selectedLoop + 1)", shared ? "Shared: new parts keep this loop" : "Not shared: new parts get a copy")
+    }
+
+    func renamePart(_ part: Int, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        partNames[part] = trimmed
+    }
+
+    func partTitle(_ part: Int) -> String { "\(part + 1) · \(partNames[part])" }
 
     // MARK: Instruments
 
@@ -471,7 +534,7 @@ final class LooperModel: ObservableObject {
         UserDefaults.standard.set(knobValues, forKey: "knobValues")
         if !knobInControl[knob] {
             // Take over once the knob reaches or crosses the current volume.
-            let target = Int((sqrt(gains[knob]) * 127).rounded())
+            let target = Int((sqrt(loops[knob].gain) * 127).rounded())
             let crossed = previous >= 0 && (previous - target) * (value - target) <= 0
             guard crossed || abs(value - target) <= 2 else { return }
             knobInControl[knob] = true
@@ -485,6 +548,11 @@ final class LooperModel: ObservableObject {
 
     private func launchkey(_ control: Launchkey.Control) {
         switch control {
+        case let .shift(down):
+            shiftDown = down
+            updateLaunchkeyLEDs(force: true)
+        case let .loopPad(pad, down: true) where shiftDown:
+            switchPart(pad)
         case let .loopPad(pad, down: true):
             selectedLoop = pad
         case let .knob(knob, value):
@@ -506,11 +574,30 @@ final class LooperModel: ObservableObject {
     }
 
     private func updateLaunchkeyLEDs(force: Bool = false) {
-        let key = loops.map { "\($0.state)/\($0.queued)" }
+        let key = shiftDown
+            ? ["parts \(currentPart) \(nextPart)"] + parts.map { "\($0.exists)" }
+            : loops.map { "\($0.state)/\($0.queued)" }
         guard force || key != lastLEDState || selectedLoop != lastLEDSelected else { return }
         lastLEDState = key
         lastLEDSelected = selectedLoop
         var messages: [[UInt8]] = []
+        if shiftDown {
+            // Shift held: the top row shows the parts. Green = playing,
+            // blinking green = next, white = another part, off = unused.
+            for part in parts {
+                let pad = part.id
+                if pad == nextPart {
+                    messages.append(Launchkey.loopPadLED(pad, color: Launchkey.Color.dimWhite))
+                    messages.append(Launchkey.loopPadLED(pad, color: Launchkey.Color.green, mode: .flashing))
+                } else if pad == currentPart {
+                    messages.append(Launchkey.loopPadLED(pad, color: Launchkey.Color.green))
+                } else {
+                    messages.append(Launchkey.loopPadLED(pad, color: part.exists ? Launchkey.Color.dimWhite : Launchkey.Color.off))
+                }
+            }
+            midi.sendToLaunchkey(messages)
+            return
+        }
         for loop in loops {
             let pad = loop.id
             let loopState = loop.state
@@ -575,6 +662,21 @@ final class LooperModel: ObservableObject {
         cycleBars = s.barLength > 0 ? Int(s.cycleLength / s.barLength) : 0
         running = s.running != 0
         positionText = Self.position(s.cyclePosition, barLength: s.barLength)
+        if Int(s.part) != currentPart {
+            currentPart = Int(s.part)
+            knobsLetGo()
+        }
+        nextPart = Int(s.nextPart)
+        partSwitchBars = s.barLength > 0 && s.partSwitchIn > 0 ? Double(s.partSwitchIn) / Double(s.barLength) : 0
+        var updatedParts = parts
+        for i in updatedParts.indices {
+            var p = RoundsPartStatus()
+            rounds_engine_get_part_status(engine, Int32(i), &p)
+            updatedParts[i].exists = p.exists != 0
+            updatedParts[i].loops = Int(p.loops)
+            updatedParts[i].cycleBars = s.barLength > 0 ? Int(p.cycleLength / s.barLength) : 0
+        }
+        if updatedParts != parts { parts = updatedParts }
         var updated = loops
         for i in updated.indices {
             var l = RoundsLoopStatus()
@@ -591,12 +693,18 @@ final class LooperModel: ObservableObject {
             updated[i].midi = l.kind == Int32(ROUNDS_KIND_MIDI.rawValue)
             updated[i].instrument = Instrument(rawValue: l.instrument) ?? .subBass
             updated[i].notes = Int(l.notes)
-            if updated[i].midi && loopState != .empty && !(loops[i].midi && loops[i].state != .empty) {
+            updated[i].loopID = Int(l.loopID)
+            updated[i].shared = l.shared != 0
+            gains[i] = l.gain
+            let sameLoop = loops[i].loopID == updated[i].loopID
+            if sameLoop && updated[i].midi && loopState != .empty && !(loops[i].midi && loops[i].state != .empty) {
                 append("Loop \(i + 1)", "Is a MIDI loop: \(updated[i].instrument.name)")
                 if i == selectedLoop && !updated[i].instrument.isKit { keysInstrument = updated[i].instrument }
             }
         }
+        let partChanged = updated.map(\.loopID) != loops.map(\.loopID)
         if updated != loops { loops = updated }
+        if partChanged { followSelectedLoop() }
         updateNoteRoutes()
         let selected = loops[selectedLoop]
         state = selected.state
@@ -643,6 +751,15 @@ final class LooperModel: ObservableObject {
                 append("Audio", String(format: "Measured round trip: %lld samples (%.1f ms). Using it from now on.",
                                        event.value, Double(event.value) * 1000 / sampleRate))
             }
+        case ROUNDS_EVENT_PART_CHANGED.rawValue:
+            append("Part", "\(partTitle(Int(event.value))) playing")
+        case ROUNDS_EVENT_PART_QUEUED.rawValue:
+            append("Part", event.value >= 0 ? "\(partTitle(Int(event.value))) starts at the end of the cycle"
+                                            : "Part switch taken back")
+        case ROUNDS_EVENT_PART_CREATED.rawValue:
+            append("Part", event.value >= 0
+                   ? "\(partTitle(Int(event.value))) made from \(partTitle(currentPart)): shared loops kept, others copied"
+                   : "All 8 parts are used")
         case ROUNDS_EVENT_QUEUE_FULL.rawValue:
             append("Loop", "Command dropped (queue full)")
         default:
