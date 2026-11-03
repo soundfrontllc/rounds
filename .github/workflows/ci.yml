@@ -29,7 +29,10 @@ jobs:
         run: |
           set -o pipefail
           xcodebuild -project Rounds.xcodeproj -scheme Rounds -configuration Debug \
-            -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO build 2>&1 \
+            -destination 'platform=macOS' -derivedDataPath build/dd CODE_SIGNING_ALLOWED=NO build 2>&1 \
             | tee build.log | grep -E "error:|warning:|BUILD SUCCEEDED|BUILD FAILED"
+      - name: Check the built app can ask for the microphone
+        # Without this key macOS feeds the app silence (or crashes it on request).
+        run: /usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" build/dd/Build/Products/Debug/Rounds.app/Contents/Info.plist
       - name: Core tests with Apple clang
         run: cmake -S Core -B Core/build -DCMAKE_BUILD_TYPE=Release && cmake --build Core/build -j && ./Core/build/rounds_tests

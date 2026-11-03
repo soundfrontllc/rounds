@@ -28,8 +28,16 @@ targets:
         product: MIDIKitIO
       - sdk: AudioToolbox.framework
       - sdk: CoreAudio.framework
+    # XcodeGen rewrites Info.plist from these properties on every generate,
+    # so keys must live here, not only in the plist.
     info:
       path: App/Rounds/Info.plist
+      properties:
+        CFBundleDevelopmentRegion: en
+        CFBundleName: Rounds
+        CFBundleShortVersionString: "0.1"
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        NSMicrophoneUsageDescription: Rounds records your guitar from your audio interface.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.soundfront.rounds

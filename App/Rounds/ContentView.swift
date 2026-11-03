@@ -92,7 +92,12 @@ struct ContentView: View {
                     .help("Play the input through Rounds. Leave off if your interface or GP-5 already monitors.")
             }
             if let error = model.audioError {
-                Text(error).foregroundStyle(.red).font(.callout)
+                HStack {
+                    Text(error).foregroundStyle(.red).font(.callout)
+                    if model.micDenied {
+                        Button("Open Microphone settings") { model.openMicrophoneSettings() }
+                    }
+                }
             }
         }
         .padding(16)
@@ -153,7 +158,7 @@ struct ContentView: View {
                 Toggle("Invert pedal", isOn: $model.invertPedal)
                     .help("Turn on if the pedal acts backwards (fires on release).")
             }
-            LegendRow(gesture: "Tap", action: "Record → Overdub → Play")
+            LegendRow(gesture: "Tap", action: "Record → Play → Overdub")
             LegendRow(gesture: "Double-tap", action: "Undo last layer")
             LegendRow(gesture: "Hold", action: "Stop")
             LegendRow(gesture: "Hold 2 s", action: "Clear")

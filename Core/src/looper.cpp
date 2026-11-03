@@ -52,9 +52,8 @@ void Looper::tap() {
             break;
         case State::Recording:
             if (!finishRecording()) return;  // too short: keep recording
-            openLayer();
-            state_ = State::Overdubbing;
-            lastTap_ = TapEffect::FinishedRecordingAndOpenedLayer;
+            state_ = State::Playing;
+            lastTap_ = TapEffect::FinishedRecording;
             break;
         case State::Overdubbing:
             closeLayer();
@@ -80,7 +79,6 @@ void Looper::revertLastTap() {
         case TapEffect::StartedRecording:
             if (state_ == State::Recording) clear();
             break;
-        case TapEffect::FinishedRecordingAndOpenedLayer:
         case TapEffect::OpenedLayer:
             if (state_ == State::Overdubbing && openLayer_ >= 0) {
                 discardLayer(openLayer_);
@@ -90,6 +88,8 @@ void Looper::revertLastTap() {
         case TapEffect::Restarted:
             if (state_ == State::Playing) state_ = State::Stopped;
             break;
+        // Closing the loop or a layer keeps what was played: nothing to revert.
+        case TapEffect::FinishedRecording:
         case TapEffect::ClosedLayer:
         case TapEffect::None:
             break;

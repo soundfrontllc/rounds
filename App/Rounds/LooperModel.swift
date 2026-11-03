@@ -1,3 +1,5 @@
+import AVFoundation
+import CoreAudio
 import Foundation
 import SwiftUI
 
@@ -38,6 +40,7 @@ final class LooperModel: ObservableObject {
     @Published var bufferFrames = 128
     @Published var audioRunning = false
     @Published var audioError: String?
+    @Published var micDenied = false
 
     @Published var state: LoopState = .empty
     @Published var loopSeconds: Double = 0
@@ -63,9 +66,17 @@ final class LooperModel: ObservableObject {
     private var engine: OpaquePointer?
     private var pollTimer: Timer?
     private let maxLoopSeconds = 120.0
+    /// The interface last started, so it is picked again when it is plugged back in.
+    private var lastDeviceName: String?
 
     init() {
         refreshDevices()
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
+                                                 mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main) { [weak self] _, _ in
+            MainActor.assumeIsolated { self?.devicesChanged() }
+        }
         router.onGesture = { [weak self] gesture in self?.logGesture(gesture) }
         router.onPedal = { [weak self] down in self?.pedalDown = down }
         midi.onLog = { [weak self] line in self?.append("MIDI", line) }
@@ -103,9 +114,66 @@ final class LooperModel: ObservableObject {
         }
     }
 
+    /// An interface was plugged in or unplugged.
+    private func devicesChanged() {
+        let before = Set(devices.map(\.name))
+        let runningID = audioRunning ? deviceID : nil
+        refreshDevices()
+        let after = Set(devices.map(\.name))
+        for name in after.subtracting(before).sorted() { append("Audio", "Connected: \(name)") }
+        for name in before.subtracting(after).sorted() { append("Audio", "Disconnected: \(name)") }
+
+        if let runningID, !devices.contains(where: { $0.id == runningID }) {
+            stopAudio()
+            audioError = "The audio interface was disconnected. Plug it back in and press Start audio."
+        }
+        if !audioRunning, let name = lastDeviceName, let match = devices.first(where: { $0.name == name }) {
+            deviceID = match.id
+        }
+    }
+
     var selectedDevice: AudioDevice? { devices.first { $0.id == deviceID } }
 
+    /// Opening the device through the HAL doesn't reliably make macOS ask for
+    /// microphone access; without it the input is silently all zeros. So ask
+    /// explicitly, and refuse to start rather than record silence.
     func startAudio() {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            micDenied = false
+            openAudio()
+        case .notDetermined:
+            append("App", "Asking macOS for microphone access")
+            Task {
+                let granted = await AVCaptureDevice.requestAccess(for: .audio)
+                append("App", granted ? "Microphone access granted" : "Microphone access denied")
+                if granted {
+                    micDenied = false
+                    openAudio()
+                } else {
+                    refuseWithoutMic()
+                }
+            }
+        default:
+            refuseWithoutMic()
+        }
+    }
+
+    private func refuseWithoutMic() {
+        stopAudio()
+        micDenied = true
+        audioError = "Rounds can't hear your interface: microphone access is off. Turn on Rounds in "
+            + "System Settings → Privacy & Security → Microphone, then restart Rounds."
+        append("Audio", "Not started: no microphone access, the input would be silent")
+    }
+
+    func openMicrophoneSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func openAudio() {
         stopAudio()
         var info = RoundsAudioInfo()
         var error = [CChar](repeating: 0, count: 256)
@@ -128,6 +196,7 @@ final class LooperModel: ObservableObject {
         }
         audioError = nil
         audioRunning = true
+        lastDeviceName = selectedDevice?.name
         sampleRate = info.sampleRate
         append("Audio", String(format: "Started %@ at %.0f Hz, %d-frame buffer, estimated latency in %d / out %d samples",
                                selectedDevice?.name ?? "device", info.sampleRate, info.bufferFrames,

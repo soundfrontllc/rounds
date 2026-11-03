@@ -1,6 +1,6 @@
 # Rounds: guitar + MIDI looper for macOS
 
-A focused live looper, a much simpler Ableton Session View with only what Corey needs. Controlled entirely from a Novation Launchkey 37 and a Yamaha FC5 footswitch (in the Launchkey's sustain jack). Guitar comes in through an audio interface.
+A focused live looper, a much simpler Ableton Session View with only what Corey needs. Controlled entirely from a Novation Launchkey 37 and a Yamaha FC5 footswitch (in the Launchkey's sustain jack). Guitar comes in through a Valeton GP-5 used as the USB audio interface ("GP-5 Audio": 2 in / 2 out at 44.1 kHz, headphones on the GP-5, which monitors the guitar directly, so Rounds' Monitor input stays off).
 
 Design references live in `design/`: `launchkey-37-mapping.png` (controller layout) and `main-window-mockup.html` (main window). Treat them as the source of truth for layout and behavior.
 
@@ -49,7 +49,7 @@ The app takes the Launchkey over in DAW/InControl mode so it can set pad LEDs an
 
 | Gesture | Action |
 |---|---|
-| Tap | Record → Overdub → Play (cycles) |
+| Tap | Record → Play → Overdub (cycles) |
 | Double-tap | Undo last layer |
 | Hold | Stop. Hold 2 s: clear |
 
@@ -84,6 +84,5 @@ Save/load sessions lands as soon as there is something worth saving (by mileston
 
 ## Open questions
 
-- Audio interface: can the GP-5 act as a USB audio interface, or is a separate one (Focusrite, MOTU M2) used?
 - Stem separation approach for milestone 6 (local model vs. external tool).
 - Does any MIDI need to go out to other apps, or is the built-in sound enough?

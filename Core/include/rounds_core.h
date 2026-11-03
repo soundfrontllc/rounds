@@ -29,7 +29,7 @@ typedef enum {
 } RoundsLoopState;
 
 typedef enum {
-    // Record -> Overdub -> Play -> Overdub ... ; from Stopped: Play.
+    // Record -> Play -> Overdub -> Play ... ; from Stopped: Play.
     ROUNDS_CMD_TAP = 0,
     // Discard the layer being overdubbed, or else remove the last layer.
     ROUNDS_CMD_UNDO = 1,

@@ -156,8 +156,7 @@ static void testRecordAndPlaybackAlignment() {
         const std::vector<int64_t> clicks = {start + 700, start + 12000, start + 24000, start + 36000};
         for (int64_t t : clicks) sim.click(t);
         sim.engine.send(ROUNDS_CMD_TAP, start);                     // record
-        sim.engine.send(ROUNDS_CMD_TAP, start + loopLength);        // -> overdub
-        sim.engine.send(ROUNDS_CMD_TAP, start + loopLength + 5000); // -> play
+        sim.engine.send(ROUNDS_CMD_TAP, start + loopLength);        // -> play
         sim.run();
 
         const RoundsStatus s = status(sim.engine);
@@ -184,7 +183,6 @@ static void testOverdubAlignment() {
     sim.click(base[0]);
     sim.engine.send(ROUNDS_CMD_TAP, start);
     sim.engine.send(ROUNDS_CMD_TAP, start + loopLength);
-    sim.engine.send(ROUNDS_CMD_TAP, start + loopLength + 1000);
     // Overdub across the loop seam in the third cycle.
     const int64_t open = start + loopLength * 3 + 30000;
     const std::vector<int64_t> dub = {open + 4000, open + 15000};  // second one after the seam
@@ -201,7 +199,7 @@ static void testOverdubAlignment() {
     CHECK(rd.worstError == 0 && rd.missing == 0, "overdub error %lld missing %d", (long long)rd.worstError,
           rd.missing);
     CHECK(rd.measured >= 14, "only %d overdub clicks measured", rd.measured);
-    CHECK(status(sim.engine).layers == 2, "layers %d", status(sim.engine).layers);
+    CHECK(status(sim.engine).layers == 1, "layers %d", status(sim.engine).layers);
 }
 
 static void testLongRunDrift() {
@@ -214,7 +212,6 @@ static void testLongRunDrift() {
     for (int64_t t : clicks) sim.click(t);
     sim.engine.send(ROUNDS_CMD_TAP, start);
     sim.engine.send(ROUNDS_CMD_TAP, start + loopLength);
-    sim.engine.send(ROUNDS_CMD_TAP, start + loopLength + 100);
     sim.run();
     const TimingResult r = measureClicks(sim, clicks, loopLength, start + loopLength + 256, total - 500);
     std::printf("  %d clicks over %.0f s, worst error %lld, drift %lld samples\n", r.measured, total / kRate,
@@ -235,7 +232,6 @@ static void testSeamIsSmooth() {
     }
     sim.engine.send(ROUNDS_CMD_TAP, start);
     sim.engine.send(ROUNDS_CMD_TAP, start + loopLength);
-    sim.engine.send(ROUNDS_CMD_TAP, start + loopLength + 4000);
     sim.run();
 
     const double normalStep = 0.5 * 2.0 * M_PI * freq / kRate;
@@ -330,7 +326,10 @@ static void testGestureCommands() {
         d.send(ROUNDS_CMD_TAP);
         d.advance(48000);
         d.send(ROUNDS_CMD_TAP);
-        CHECK(d.s().state == ROUNDS_LOOP_OVERDUBBING, "record -> overdub (%d)", d.s().state);
+        CHECK(d.s().state == ROUNDS_LOOP_PLAYING && d.s().layers == 0, "record -> play (%d)", d.s().state);
+        d.advance(4800);
+        d.send(ROUNDS_CMD_TAP);
+        CHECK(d.s().state == ROUNDS_LOOP_OVERDUBBING, "play -> overdub");
         d.advance(4800);
         d.send(ROUNDS_CMD_TAP);
         CHECK(d.s().state == ROUNDS_LOOP_PLAYING && d.s().layers == 1, "overdub -> play, 1 layer");
@@ -347,12 +346,12 @@ static void testGestureCommands() {
         Driver d;
         d.send(ROUNDS_CMD_TAP);
         d.advance(48000);
-        d.send(ROUNDS_CMD_TAP);  // -> overdub (opened by this press)
+        d.send(ROUNDS_CMD_TAP);  // -> play (loop closed by this press)
         d.send(ROUNDS_CMD_STOP_REVERTING_TAP);
         CHECK(d.s().state == ROUNDS_LOOP_STOPPED && d.s().layers == 0, "hold right after finishing a loop stops it");
         d.send(ROUNDS_CMD_TAP);
         CHECK(d.s().state == ROUNDS_LOOP_PLAYING, "tap restarts");
-        d.send(ROUNDS_CMD_TAP);
+        d.send(ROUNDS_CMD_TAP);  // -> overdub
         d.advance(4800);
         d.send(ROUNDS_CMD_TAP);  // overdub closed by this press
         d.send(ROUNDS_CMD_STOP_REVERTING_TAP);
@@ -370,6 +369,15 @@ static void testGestureCommands() {
         d.send(ROUNDS_CMD_TAP);
         CHECK(d.s().state == ROUNDS_LOOP_RECORDING, "a tap too soon (<100 ms) doesn't close the loop");
     }
+    {
+        Driver d;
+        d.send(ROUNDS_CMD_TAP);
+        d.advance(48000);
+        d.send(ROUNDS_CMD_TAP);  // -> play (loop closed by this press)
+        d.send(ROUNDS_CMD_UNDO_REVERTING_TAP);
+        CHECK(d.s().state == ROUNDS_LOOP_PLAYING && d.s().loopLength > 0,
+              "double-tap right after closing the loop keeps it playing (state %d)", d.s().state);
+    }
 }
 
 static void testManyLayersMerge() {
@@ -382,7 +390,6 @@ static void testManyLayersMerge() {
     sim.click(start + 1000);
     sim.engine.send(ROUNDS_CMD_TAP, start);
     sim.engine.send(ROUNDS_CMD_TAP, start + loopLength);
-    sim.engine.send(ROUNDS_CMD_TAP, start + loopLength + 500);
     std::vector<int64_t> dubIndexes;
     for (int i = 0; i < dubs; i++) {
         const int64_t open = start + loopLength * (2 + i) + 2000 + i * 3000;

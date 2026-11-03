@@ -56,7 +56,7 @@ public:
     int64_t clock() const { return clock_; }
 
 private:
-    enum class TapEffect { None, StartedRecording, FinishedRecordingAndOpenedLayer, OpenedLayer, ClosedLayer, Restarted };
+    enum class TapEffect { None, StartedRecording, FinishedRecording, OpenedLayer, ClosedLayer, Restarted };
 
     struct Layer {
         std::vector<float> buffer;
