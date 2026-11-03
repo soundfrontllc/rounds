@@ -2,12 +2,33 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "midi_notes.h"
 #include "rounds_core.h"
 
 namespace rounds {
+
+// Overdub layer buffers, shared by every loop of an engine (or owned by one
+// loop on its own). A loop holds a layer from the overdub that opens it until
+// the layer is undone or merged into the loop's base.
+struct LayerPool {
+    struct Layer {
+        std::vector<float> buffer;
+        bool inUse = false;
+        uint64_t age = 0;         // when it was opened, pool-wide
+        int64_t startS = 0;       // real time the layer starts recording
+        int64_t closeS = INT64_MAX;  // real time it was closed (tail continues for crossfade)
+        int64_t openIndex = 0;    // loop index of its first sample
+        int64_t written = 0;      // samples written so far
+        bool writing = true;      // false once the punch-out tail is done
+    };
+    LayerPool(int layers, int64_t samples);
+    int freeCount() const;
+    std::vector<Layer> layers;
+    uint64_t counter = 0;
+};
 
 // One loop with an undoable stack of overdub layers. A loop records audio
 // until a note arrives while it records; it is then a MIDI loop, keeping
@@ -40,7 +61,8 @@ public:
         int64_t notePreroll = 4410;    // a note this early for a recording or overdub still counts
     };
 
-    explicit Looper(const Config& config);
+    // Without a pool the loop gets its own, with room for its undo layers.
+    explicit Looper(const Config& config, LayerPool* pool = nullptr);
 
     void setLatency(int inputLatency, int outputLatency);
     // Closed loops snap to a power-of-two number of bars (1, 2, 4, 8 ...).
@@ -69,6 +91,7 @@ public:
     void clear();
 
     // Adds the loop's playback (times `gain`) into `out`, and records `in`.
+    // out == nullptr: the loop is in a part that isn't playing; it only keeps time.
     void process(const float* in, float* out, int frames, float gain);
 
     State state() const { return state_; }
@@ -82,6 +105,18 @@ public:
     Kind kind() const { return kind_; }
     int noteCount() const { return noteCount_; }
     int maxNotes() const { return config_.maxNotes; }
+
+    // Shared pool upkeep: when the pool runs low the engine merges the
+    // globally oldest closed layer into its loop's base, a slice per block.
+    // Age of this loop's oldest closed layer that could be merged now (0 = none).
+    uint64_t oldestLayerAge() const;
+    void mergeOldestLayer();
+    bool merging() const { return flattenSlot_ >= 0; }
+
+    // Copies another loop (a new part's copy of a loop): overdubs merged, no
+    // undo history. copySlice() a range of samples at a time, then finishCopy().
+    void copySlice(const Looper& source, int64_t offset, int64_t count);
+    void finishCopy(const Looper& source);
 
     // A key pressed or released at real time `s`. Recorded while recording or
     // overdubbing (a recording becomes MIDI on its first note); notes pressed
@@ -106,15 +141,9 @@ public:
 private:
     enum class TapEffect { None, StartedRecording, FinishedRecording, OpenedLayer, ClosedLayer, Restarted };
 
-    struct Layer {
-        std::vector<float> buffer;
-        bool inUse = false;
-        int64_t startS = 0;       // real time the layer starts recording
-        int64_t closeS = INT64_MAX;  // real time it was closed (tail continues for crossfade)
-        int64_t openIndex = 0;    // loop index of its first sample
-        int64_t written = 0;      // samples written so far
-        bool writing = true;      // false once the punch-out tail is done
-    };
+    using Layer = LayerPool::Layer;
+    Layer& layer(int slot) { return pool_->layers[static_cast<size_t>(slot)]; }
+    const Layer& layer(int slot) const { return pool_->layers[static_cast<size_t>(slot)]; }
 
     // index: loop index (from the recording's start while recording);
     // length -1 while the key is held; layer -1 = base.
@@ -173,8 +202,9 @@ private:
     int64_t barLength_ = 0;
     std::vector<float> history_;  // input by real time, modulo its size
 
-    std::vector<Layer> layers_;
-    std::vector<int> order_;  // slots of layers in the stack, oldest first
+    std::unique_ptr<LayerPool> ownPool_;
+    LayerPool* pool_;
+    std::vector<int> order_;  // pool slots of this loop's layers, oldest first
     int openLayer_ = -1;      // slot of the layer being overdubbed, -1 if none
 
     int flattenSlot_ = -1;    // oldest layer being merged into the base
