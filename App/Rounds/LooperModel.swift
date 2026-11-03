@@ -31,6 +31,17 @@ enum LoopState: Int32 {
     }
 }
 
+/// One loop slot as the UI sees it.
+struct LoopInfo: Identifiable, Equatable {
+    let id: Int
+    var state: LoopState = .empty
+    var seconds: Double = 0          // loop length, or recorded so far while recording
+    var position: Double = 0         // 0...1
+    var layers = 0
+    var level: Float = 0
+    var gain: Float = 1
+}
+
 /// UI-side state. Polls the engine; never touches the audio thread directly.
 @MainActor
 final class LooperModel: ObservableObject {
@@ -57,20 +68,52 @@ final class LooperModel: ObservableObject {
     @Published var monitorInput = false { didSet { applyMonitor() } }
     @Published var invertPedal = false { didSet { midi.invertPedal = invertPedal } }
 
+    /// Loop slot the footswitch and keys act on (0...7).
+    @Published var selectedLoop = 0 {
+        didSet {
+            router.select(loop: selectedLoop)
+            updateLaunchkeyLEDs()
+        }
+    }
+    @Published var loops: [LoopInfo] = (0..<Int(ROUNDS_MAX_LOOPS)).map { LoopInfo(id: $0) }
+    /// Length later loops snap to, set by the first loop recorded.
+    @Published var baseSeconds: Double = 0
+    @Published var baseLoop = -1
+    /// Kept here so volumes survive restarting the audio device.
+    private var gains = [Float](repeating: 1, count: Int(ROUNDS_MAX_LOOPS))
+    /// The Launchkey can't report where its knobs are, so the last value each
+    /// knob sent is remembered across launches (-1 = never seen).
+    private var knobValues = UserDefaults.standard.array(forKey: "knobValues") as? [Int]
+        ?? [Int](repeating: -1, count: Int(ROUNDS_MAX_LOOPS))
+    /// False while a loop's volume differs from its knob (changed in the window,
+    /// or the knob moved while Rounds was closed): the knob then picks the
+    /// volume up only once it passes it, instead of jumping.
+    private var knobInControl = [Bool](repeating: true, count: Int(ROUNDS_MAX_LOOPS))
+
+    /// Folder of the session last saved or opened (nil = never saved).
+    @Published var sessionURL: URL?
+    @Published var sessionBusy = false
+    @Published var sessionMessage: String?
+    var sessionName: String { sessionURL?.lastPathComponent ?? "Untitled" }
+
     @Published var log: [LogEntry] = []
     @Published var showLog = true
 
     let router = ControlRouter()
     private lazy var midi = MIDIInput(router: router)
     private var audio: OpaquePointer?
-    private var engine: OpaquePointer?
+    private(set) var engine: OpaquePointer?
     private var pollTimer: Timer?
-    private let maxLoopSeconds = 120.0
+    /// Per loop slot. All 8 slots' buffers (with 8 undo layers each) are
+    /// allocated when audio starts: about 1 GB at 48 kHz.
+    let maxLoopSeconds = 60.0
     /// The interface last started, so it is picked again when it is plugged back in.
     private var lastDeviceName: String?
 
     init() {
         refreshDevices()
+        for (loop, value) in knobValues.enumerated() where value >= 0 { gains[loop] = Self.knobGain(value) }
+        loops = loops.map { var l = $0; l.gain = gains[$0.id]; return l }
         var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
                                                  mScope: kAudioObjectPropertyScopeGlobal,
                                                  mElement: kAudioObjectPropertyElementMain)
@@ -80,6 +123,12 @@ final class LooperModel: ObservableObject {
         router.onGesture = { [weak self] gesture in self?.logGesture(gesture) }
         router.onPedal = { [weak self] down in self?.pedalDown = down }
         midi.onLog = { [weak self] line in self?.append("MIDI", line) }
+        midi.onLaunchkey = { [weak self] control in self?.launchkey(control) }
+        midi.onLaunchkeyReady = { [weak self] in self?.updateLaunchkeyLEDs(force: true) }
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil,
+                                               queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.midi.releaseLaunchkey() }
+        }
         do {
             try midi.start()
             append("App", "Listening to all MIDI inputs")
@@ -187,7 +236,9 @@ final class LooperModel: ObservableObject {
         audio = io
         engine = rounds_audio_engine(io)
         applyMonitor()
+        for loop in gains.indices { applyGain(loop, gains[loop]) }
         router.setEngine(engine)
+        router.select(loop: selectedLoop)
         guard rounds_audio_start(io) == 1 else {
             audioError = "The device didn't start"
             append("Audio", "Device didn't start")
@@ -225,6 +276,19 @@ final class LooperModel: ObservableObject {
         rounds_engine_set_monitor_gain(engine, monitorInput ? 1.0 : 0.0)
     }
 
+    /// Loop volume, linear (1 = as recorded).
+    /// Volume from the window (or a loaded session): the knob no longer matches.
+    func setGain(_ loop: Int, _ gain: Float) {
+        knobInControl[loop] = false
+        applyGain(loop, gain)
+    }
+
+    private func applyGain(_ loop: Int, _ gain: Float) {
+        gains[loop] = gain
+        loops[loop].gain = gain
+        if let engine { rounds_engine_set_loop_gain(engine, Int32(loop), gain) }
+    }
+
     // MARK: Controls
 
     func tap() { router.send(ROUNDS_CMD_TAP) }
@@ -234,6 +298,82 @@ final class LooperModel: ObservableObject {
 
     /// The space bar stands in for the footswitch.
     func spaceBar(down: Bool) { router.pedal(down: down, hostTime: 0) }
+
+    // MARK: Launchkey
+
+    /// Slot colours on the pads. Red is left out: it means recording.
+    static let slotColors: [UInt8] = [
+        Launchkey.Color.orange, Launchkey.Color.blue, Launchkey.Color.pink, Launchkey.Color.purple,
+        Launchkey.Color.green, Launchkey.Color.cyan, Launchkey.Color.yellow, Launchkey.Color.white,
+    ]
+    /// Squared so the low end of the knob has finer control.
+    static func knobGain(_ value: Int) -> Float {
+        let fraction = Float(value) / 127
+        return fraction * fraction
+    }
+
+    private func knobMoved(_ knob: Int, to value: Int) {
+        let previous = knobValues[knob]
+        knobValues[knob] = value
+        UserDefaults.standard.set(knobValues, forKey: "knobValues")
+        if !knobInControl[knob] {
+            // Take over once the knob reaches or crosses the current volume.
+            let target = Int((sqrt(gains[knob]) * 127).rounded())
+            let crossed = previous >= 0 && (previous - target) * (value - target) <= 0
+            guard crossed || abs(value - target) <= 2 else { return }
+            knobInControl[knob] = true
+            append("Launchkey", "Knob \(knob + 1) picked up loop \(knob + 1)'s volume")
+        }
+        applyGain(knob, Self.knobGain(value))
+    }
+
+    private var lastLEDState: [LoopState]?
+    private var lastLEDSelected = -1
+
+    private func launchkey(_ control: Launchkey.Control) {
+        switch control {
+        case let .loopPad(pad, down: true):
+            selectedLoop = pad
+        case let .knob(knob, value):
+            knobMoved(knob, to: value)
+        case let .drumPad(pad, velocity):
+            midi.sendToLaunchkey([Launchkey.drumPadLED(pad, color: velocity > 0 ? Launchkey.Color.white : 0)])
+        case .padMode(let mode) where mode != 2:
+            // Pads were switched away from Session (Shift menu); take them back.
+            midi.sendToLaunchkey([Launchkey.padModeSession])
+            updateLaunchkeyLEDs(force: true)
+        default:
+            break
+        }
+    }
+
+    private func updateLaunchkeyLEDs(force: Bool = false) {
+        let states = loops.map(\.state)
+        guard force || states != lastLEDState || selectedLoop != lastLEDSelected else { return }
+        lastLEDState = states
+        lastLEDSelected = selectedLoop
+        var messages: [[UInt8]] = []
+        for (pad, loopState) in states.enumerated() {
+            let color = Self.slotColors[pad]
+            switch loopState {
+            case .empty:
+                messages.append(Launchkey.loopPadLED(pad, color: Launchkey.Color.off))
+            case .recording:
+                messages.append(Launchkey.loopPadLED(pad, color: Launchkey.Color.red))
+            case .overdubbing:
+                messages.append(Launchkey.loopPadLED(pad, color: color))
+                messages.append(Launchkey.loopPadLED(pad, color: Launchkey.Color.red, mode: .flashing))
+            case .playing:
+                messages.append(Launchkey.loopPadLED(pad, color: color))
+            case .stopped:
+                messages.append(Launchkey.loopPadLED(pad, color: Launchkey.Color.dimWhite))
+            }
+            if pad == selectedLoop && loopState != .overdubbing {
+                messages.append(Launchkey.loopPadLED(pad, color: Launchkey.Color.white, mode: .flashing))
+            }
+        }
+        midi.sendToLaunchkey(messages)
+    }
 
     // MARK: Polling
 
@@ -245,17 +385,34 @@ final class LooperModel: ObservableObject {
         }
         var s = RoundsStatus()
         rounds_engine_get_status(engine, &s)
-        state = LoopState(rawValue: s.state) ?? .empty
         sampleRate = s.sampleRate
-        loopSeconds = Double(s.loopLength) / s.sampleRate
-        recordedSeconds = Double(s.recordedLength) / s.sampleRate
-        position = s.loopLength > 0 ? Double(s.playPosition) / Double(s.loopLength) : 0
-        layers = Int(s.layers)
+        baseSeconds = Double(s.baseLength) / s.sampleRate
+        baseLoop = Int(s.baseLoop)
+        var updated = loops
+        for i in updated.indices {
+            var l = RoundsLoopStatus()
+            rounds_engine_get_loop_status(engine, Int32(i), &l)
+            let loopState = LoopState(rawValue: l.state) ?? .empty
+            updated[i].state = loopState
+            updated[i].seconds = Double(loopState == .recording ? l.recordedLength : l.loopLength) / s.sampleRate
+            updated[i].position = l.loopLength > 0 ? Double(l.playPosition) / Double(l.loopLength) : 0
+            updated[i].layers = Int(l.layers)
+            updated[i].level = max(l.peak, updated[i].level * 0.8)
+            updated[i].gain = l.gain
+        }
+        if updated != loops { loops = updated }
+        let selected = loops[selectedLoop]
+        state = selected.state
+        loopSeconds = selected.state == .recording ? 0 : selected.seconds
+        recordedSeconds = selected.state == .recording ? selected.seconds : 0
+        position = selected.position
+        layers = selected.layers
         inputLevel = max(s.inputPeak, inputLevel * 0.8)
         outputLevel = max(s.outputPeak, outputLevel * 0.8)
         latencyIn = Int(s.inputLatency)
         latencyOut = Int(s.outputLatency)
         calibrating = s.calibrating != 0
+        updateLaunchkeyLEDs()
 
         var event = RoundsEvent()
         while rounds_engine_poll_event(engine, &event) == 1 {
@@ -266,11 +423,15 @@ final class LooperModel: ObservableObject {
     private func describe(_ event: RoundsEvent, sampleRate: Double) {
         switch UInt32(event.type) {
         case ROUNDS_EVENT_STATE_CHANGED.rawValue:
-            append("Loop", "→ \(LoopState(rawValue: Int32(event.value))?.label ?? "?")")
+            append("Loop \(event.loop + 1)", "→ \(LoopState(rawValue: Int32(event.value))?.label ?? "?")")
         case ROUNDS_EVENT_LOOP_LENGTH.rawValue where event.value > 0:
-            append("Loop", String(format: "Length %.3f s (%lld samples)", Double(event.value) / sampleRate, event.value))
+            var text = String(format: "Length %.3f s (%lld samples)", Double(event.value) / sampleRate, event.value)
+            if baseLoop >= 0 && baseLoop != Int(event.loop) && baseSeconds > 0 {
+                text += String(format: ", %@ of the base", ratioText(Double(event.value) / sampleRate / baseSeconds))
+            }
+            append("Loop \(event.loop + 1)", text)
         case ROUNDS_EVENT_LAYER_COUNT.rawValue:
-            append("Loop", "Layers: \(event.value)")
+            append("Loop \(event.loop + 1)", "Layers: \(event.value)")
         case ROUNDS_EVENT_CALIBRATION_DONE.rawValue:
             if event.value < 0 {
                 append("Audio", "Latency measurement failed: no clicks came back. Check the loopback cable and input level.")
@@ -283,6 +444,10 @@ final class LooperModel: ObservableObject {
         default:
             break
         }
+    }
+
+    func ratioText(_ ratio: Double) -> String {
+        ratio >= 1 ? String(format: "%.0f×", ratio) : "1/\(Int((1 / ratio).rounded()))×"
     }
 
     private func logGesture(_ gesture: RoundsGesture) {
@@ -298,7 +463,42 @@ final class LooperModel: ObservableObject {
     }
 
     func append(_ source: String, _ text: String) {
-        log.append(LogEntry(time: Date(), source: source, text: text))
+        let entry = LogEntry(time: Date(), source: source, text: text)
+        log.append(entry)
         if log.count > 500 { log.removeFirst(log.count - 500) }
+        logFile.write(entry)
+    }
+
+    private let logFile = LogFile()
+}
+
+/// Mirrors the event log to ~/Library/Logs/Rounds/events.log (a new file each
+/// launch) so a whole test session can be read back without copying from the UI.
+final class LogFile: @unchecked Sendable {
+    static let url = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/Rounds/events.log")
+
+    private let queue = DispatchQueue(label: "rounds.logfile", qos: .utility)
+    private var handle: FileHandle?
+    private let format: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        return f
+    }()
+
+    init() {
+        queue.async {
+            let fm = FileManager.default
+            try? fm.createDirectory(at: Self.url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            fm.createFile(atPath: Self.url.path, contents: nil)
+            self.handle = try? FileHandle(forWritingTo: Self.url)
+        }
+    }
+
+    func write(_ entry: LogEntry) {
+        queue.async {
+            let line = "\(self.format.string(from: entry.time))  \(entry.source.padding(toLength: 10, withPad: " ", startingAt: 0))  \(entry.text)\n"
+            self.handle?.write(Data(line.utf8))
+        }
     }
 }

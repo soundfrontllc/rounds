@@ -1,7 +1,9 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -12,10 +14,16 @@
 
 namespace rounds {
 
-// Owns the looper and everything the audio thread touches. process() is the
+// Owns the loopers and everything the audio thread touches. process() is the
 // real-time entry point; every other public method is for other threads.
+//
+// All loops advance on one sample clock. The first loop recorded sets the
+// base length and later loops snap to 1/8x ... 8x of it, so loops of
+// different lengths stay in step forever.
 class Engine {
 public:
+    static constexpr int kLoops = ROUNDS_MAX_LOOPS;
+
     Engine(double sampleRate, double maxLoopSeconds, int maxBlockFrames);
 
     // Real-time.
@@ -24,31 +32,66 @@ public:
                       double hostTicksPerSample);
 
     // Any non-real-time thread.
-    bool send(RoundsCommand cmd, int64_t sampleTime);
-    bool sendAtHostTime(RoundsCommand cmd, uint64_t hostTime);
+    bool send(int loop, RoundsCommand cmd, int64_t sampleTime);
+    bool sendAtHostTime(int loop, RoundsCommand cmd, uint64_t hostTime);
     void setLatency(int inputLatency, int outputLatency);
     void setMonitorGain(float gain) { monitorGain_.store(gain); }
-    void setLoopGain(float gain) { loopGain_.store(gain); }
+    void setLoopGain(int loop, float gain);
     void startCalibration() { calibrateRequested_.store(true); }
     void getStatus(RoundsStatus* out);
+    void getLoopStatus(int loop, RoundsLoopStatus* out);
     bool pollEvent(RoundsEvent* out) { return events_.pop(*out); }
+
+    // Session save/load: one loop at a time through a buffer the audio thread
+    // copies a slice of per block (see rounds_core.h).
+    bool beginExport(int loop);
+    bool beginImport(int loop, const float* samples, int64_t length);
+    int transferStatus();
+    int64_t takeExport(float* dest, int64_t capacity);
+    int64_t maxLoopSamples() const { return loops_[0]->maxLoopSamples(); }
 
     double sampleRate() const { return sampleRate_; }
 
 private:
     struct Command {
+        int32_t loop;
         int32_t cmd;
         int64_t time;
     };
 
-    void apply(int32_t cmd);
+    // What the UI last heard about each loop, to emit changes only.
+    struct Published {
+        int state = -1;
+        int64_t length = -1;
+        int layers = -1;
+    };
+
+    // Published by the audio thread for the UI, one per loop.
+    struct LoopStats {
+        std::atomic<int> state{0};
+        std::atomic<int64_t> length{0};
+        std::atomic<int64_t> recorded{0};
+        std::atomic<int64_t> position{0};
+        std::atomic<int> layers{0};
+        std::atomic<int> layerOpen{0};
+        std::atomic<float> peak{0.0f};
+    };
+
+    void apply(int loop, int32_t cmd);
+    void updateBase();
+    bool anyAudible() const;
     void publish();
-    void emit(RoundsEventType type, int64_t value);
+    void emit(RoundsEventType type, int loop, int64_t value);
     void processChunk(const float* input, float* out, int frames);
+    void stepTransfer();
+    bool importing(int loop) const;
+
+    enum Transfer { kIdle, kExportRequested, kExporting, kExportDone, kImportRequested, kImporting, kImportDone, kFailed };
+    static constexpr int64_t kTransferSlice = 32768;
 
     double sampleRate_;
     int maxBlock_;
-    Looper looper_;
+    std::vector<std::unique_ptr<Looper>> loops_;
     LatencyProbe probe_;
 
     // Commands: producers serialize on a mutex (never touched by the audio
@@ -62,9 +105,11 @@ private:
     int pendingCount_ = 0;
     int64_t now_ = 0;
     std::vector<float> zeros_;
-    int lastState_ = -1;
-    int64_t lastLength_ = -1;
-    int lastLayers_ = -1;
+    std::vector<float> scratch_;          // one loop's output, for its peak
+    std::array<float, kLoops> chunkPeak_{};
+    std::array<Published, kLoops> published_{};
+    int64_t baseLength_ = 0;
+    int baseLoop_ = -1;
     int appliedInputLatency_ = -1;
     int appliedOutputLatency_ = -1;
 
@@ -72,16 +117,21 @@ private:
     std::atomic<int> inputLatency_{0};
     std::atomic<int> outputLatency_{0};
     std::atomic<float> monitorGain_{0.0f};
-    std::atomic<float> loopGain_{1.0f};
+    std::array<std::atomic<float>, kLoops> loopGain_;
     std::atomic<bool> calibrateRequested_{false};
 
-    // Published by the audio thread for the UI.
-    std::atomic<int> statState_{0};
-    std::atomic<int64_t> statLength_{0};
-    std::atomic<int64_t> statRecorded_{0};
-    std::atomic<int64_t> statPosition_{0};
-    std::atomic<int> statLayers_{0};
-    std::atomic<int> statLayerOpen_{0};
+    // Transfer: other threads own the buffer while the state is Idle, *Done or
+    // Failed; the audio thread owns it from *Requested until it sets *Done or Failed.
+    std::atomic<int> transfer_{kIdle};
+    std::vector<float> transferBuffer_;
+    int transferLoop_ = -1;
+    int64_t transferLength_ = 0;
+    int64_t transferPos_ = 0;
+    int64_t transferRotation_ = 0;  // export: loop index of saved sample 0
+
+    std::array<LoopStats, kLoops> loopStats_;
+    std::atomic<int64_t> statBase_{0};
+    std::atomic<int> statBaseLoop_{-1};
     std::atomic<float> statInputPeak_{0.0f};
     std::atomic<float> statOutputPeak_{0.0f};
     std::atomic<int> statCalibrating_{0};
