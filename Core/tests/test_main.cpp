@@ -655,7 +655,7 @@ static void testSaveAndLoad() {
             int64_t error = 0;
             for (size_t i = 0; i < 3; i++) {
                 int64_t best = INT64_MAX;
-                for (size_t j = 0; j < 3; j++) best = std::min(best, std::llabs(mod(heardB[j] - heardA[i] - shift + L, 2 * L) - L));
+                for (size_t j = 0; j < 3; j++) best = std::min<int64_t>(best, std::llabs(mod(heardB[j] - heardA[i] - shift + L, 2 * L) - L));
                 error = std::max(error, best);
             }
             worst = std::min(worst, error);
