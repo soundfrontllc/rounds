@@ -97,6 +97,9 @@ final class MIDIInput: @unchecked Sendable {
                 // Record is the footswitch's tap; keep the MIDI timestamp for timing.
                 if control == .record(down: true) { router.tap(hostTime: timeStamp) }
                 if control == .play(down: true) { router.startStopAll(hostTime: timeStamp) }
+                if case let .drumPad(pad, velocity) = control {
+                    router.drum(DrumPads.notes[pad], velocity: Int32(velocity), hostTime: timeStamp)
+                }
                 // A held pad streams pressure every ~10 ms; it would bury the log.
                 if control == .padPressure { continue }
                 DispatchQueue.main.async { [weak self] in
@@ -111,6 +114,16 @@ final class MIDIInput: @unchecked Sendable {
                 var down = value >= 64
                 if invertPedal { down.toggle() }
                 router.pedal(down: down, hostTime: timeStamp)
+            }
+            // Keys (the Launchkey's MIDI port, or any other keyboard), on any
+            // channel: Corey's Launchkey sends its keys on channel 10.
+            switch event {
+            case let .noteOn(payload):
+                router.key(Int32(payload.note.number), velocity: Int32(payload.velocity.midi1Value), hostTime: timeStamp)
+            case let .noteOff(payload):
+                router.key(Int32(payload.note.number), velocity: 0, hostTime: timeStamp)
+            default:
+                break
             }
             let line = "\(sourceName): \(event)"
             DispatchQueue.main.async { [weak self] in self?.onLog?(line) }

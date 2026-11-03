@@ -20,6 +20,7 @@ Looper::Looper(const Config& config) : config_(config) {
     for (auto& layer : layers_) layer.buffer.assign(static_cast<size_t>(config_.maxLoopSamples), 0.0f);
     order_.reserve(layers_.size());
     history_.assign(static_cast<size_t>(std::max(1, config_.historySamples)), 0.0f);
+    notes_.resize(static_cast<size_t>(std::max(1, config_.maxNotes)));
 }
 
 void Looper::setLatency(int inputLatency, int outputLatency) {
@@ -157,6 +158,8 @@ void Looper::clear() {
     order_.clear();
     openLayer_ = -1;
     flattenSlot_ = -1;
+    kind_ = Kind::Audio;
+    noteCount_ = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +179,7 @@ void Looper::startRecording(int64_t from) {
     for (int64_t s = from; s < heard; s++) {
         base_[static_cast<size_t>(baseWritten_++)] = s >= heard - size ? history_[static_cast<size_t>(wrap(s, size))] : 0.0f;
     }
+    replayRecent(from, -1);
 }
 
 bool Looper::finishRecording() {
@@ -184,6 +188,17 @@ bool Looper::finishRecording() {
         std::max<int64_t>(config_.minLoopSamples, inputLatency_ + outputLatency_ + 2 * config_.crossfadeSamples);
     if (length < minimum) return false;
     loopLength_ = snapLength(std::min(length, config_.maxLoopSamples), minimum);
+    if (kind_ == Kind::Midi) {
+        // Notes past the snapped end were the next time round: drop them.
+        int kept = 0;
+        for (int i = 0; i < noteCount_; i++) {
+            Note n = notes_[static_cast<size_t>(i)];
+            if (n.index >= loopLength_) continue;
+            if (n.length >= 0) n.length = std::min(n.length, loopLength_ - 1);
+            notes_[static_cast<size_t>(kept++)] = n;
+        }
+        noteCount_ = kept;
+    }
     // Input keeps arriving for inputLatency samples, plus crossfadeSamples of
     // overflow past the end for the seam crossfade; writeInput() finishes it.
     return true;
@@ -229,6 +244,7 @@ int Looper::openLayer() {
     layer.writing = true;
     order_.push_back(slot);
     openLayer_ = slot;
+    if (kind_ == Kind::Midi) replayRecent(clock_, slot);
     return slot;
 }
 
@@ -244,6 +260,7 @@ void Looper::discardLayer(int slot) {
     layers_[static_cast<size_t>(slot)].inUse = false;
     order_.erase(std::remove(order_.begin(), order_.end(), slot), order_.end());
     if (slot == openLayer_) openLayer_ = -1;
+    removeNotes(slot);
 }
 
 void Looper::removeLastClosedLayer() {
@@ -281,11 +298,126 @@ void Looper::finishLoad(int64_t length, int64_t origin) {
 }
 
 // ---------------------------------------------------------------------------
+// MIDI
+
+// Loop index of a note pressed at real time `pressS`. While recording, a note
+// slightly before the start lands on it.
+void Looper::addNote(int64_t pressS, int64_t releaseS, int note, int velocity, int layer) {
+    if (noteCount_ >= config_.maxNotes) return;
+    int64_t index = pressS - origin_;
+    index = loopLength_ > 0 ? wrap(index, loopLength_) : std::max<int64_t>(0, index);
+    int64_t length = releaseS >= 0 ? std::max<int64_t>(1, releaseS - pressS) : -1;
+    if (loopLength_ > 0 && length >= 0) length = std::min(length, loopLength_ - 1);
+    notes_[static_cast<size_t>(noteCount_++)] = Note{index, length, pressS, note, velocity, layer};
+}
+
+void Looper::removeNotes(int layer) {
+    int kept = 0;
+    for (int i = 0; i < noteCount_; i++) {
+        if (notes_[static_cast<size_t>(i)].layer != layer) notes_[static_cast<size_t>(kept++)] = notes_[static_cast<size_t>(i)];
+    }
+    noteCount_ = kept;
+}
+
+void Looper::replayRecent(int64_t from, int layer) {
+    for (Recent& r : recent_) {
+        if (r.used || r.pressS < from - config_.notePreroll || r.pressS > clock_) continue;
+        r.used = true;
+        kind_ = Kind::Midi;
+        addNote(r.pressS, r.releaseS, r.note, r.velocity, layer);
+    }
+}
+
+void Looper::notePressed(int note, int velocity, int64_t s) {
+    if (state_ == State::Recording) {
+        kind_ = Kind::Midi;
+        addNote(s, -1, note, velocity, -1);
+    } else if (state_ == State::Overdubbing && kind_ == Kind::Midi && openLayer_ >= 0) {
+        addNote(s, -1, note, velocity, openLayer_);
+    } else {
+        recent_[static_cast<size_t>(recentNext_)] = Recent{s, -1, note, velocity, false};
+        recentNext_ = (recentNext_ + 1) % static_cast<int>(recent_.size());
+    }
+}
+
+void Looper::noteReleased(int note, int64_t s) {
+    for (int i = noteCount_ - 1; i >= 0; i--) {
+        Note& n = notes_[static_cast<size_t>(i)];
+        if (n.note != note || n.length >= 0) continue;
+        n.length = std::max<int64_t>(1, s - n.pressS);
+        if (loopLength_ > 0) n.length = std::min(n.length, loopLength_ - 1);
+        return;
+    }
+    for (Recent& r : recent_) {
+        if (!r.used && r.note == note && r.releaseS < 0) r.releaseS = s;
+    }
+}
+
+int Looper::collectNotes(int frames, NoteEvent* out, int capacity) const {
+    if (kind_ != Kind::Midi || loopLength_ <= 0) return 0;
+    if (state_ != State::Playing && state_ != State::Overdubbing) return 0;
+    const int64_t start = wrap(clock_ + outputLatency_ - origin_, loopLength_);
+    int count = 0;
+    for (int i = 0; i < noteCount_ && count + 2 <= capacity; i++) {
+        const Note& n = notes_[static_cast<size_t>(i)];
+        const int64_t on = wrap(n.index - start, loopLength_);
+        if (on < frames) out[count++] = NoteEvent{static_cast<int>(on), n.note, n.velocity};
+        if (n.length >= 0) {
+            const int64_t off = wrap(n.index + n.length - start, loopLength_);
+            if (off < frames) out[count++] = NoteEvent{static_cast<int>(off), n.note, 0};
+        }
+    }
+    // By offset; at the same offset a note ends before one starts.
+    for (int i = 1; i < count; i++) {
+        const NoteEvent e = out[i];
+        int j = i;
+        while (j > 0 && (out[j - 1].offset > e.offset ||
+                         (out[j - 1].offset == e.offset && out[j - 1].velocity > 0 && e.velocity == 0))) {
+            out[j] = out[j - 1];
+            j--;
+        }
+        out[j] = e;
+    }
+    return count;
+}
+
+int Looper::exportNotes(RoundsNote* dest, int capacity, int64_t rotation) const {
+    if (kind_ != Kind::Midi || loopLength_ <= 0) return 0;
+    int count = 0;
+    for (int i = 0; i < noteCount_ && count < capacity; i++) {
+        const Note& n = notes_[static_cast<size_t>(i)];
+        // A key still held when saving gets a sixteenth of the loop.
+        const int64_t length = n.length >= 0 ? n.length : std::max<int64_t>(1, loopLength_ / 16);
+        dest[count++] = RoundsNote{wrap(n.index - rotation, loopLength_), length, n.note, n.velocity};
+    }
+    return count;
+}
+
+void Looper::loadNotes(const RoundsNote* notes, int count, int64_t length, int64_t origin) {
+    clear();
+    loopLength_ = std::min(length, config_.maxLoopSamples);
+    if (loopLength_ <= 1) {
+        loopLength_ = 0;
+        return;
+    }
+    kind_ = Kind::Midi;
+    origin_ = origin;
+    for (int i = 0; i < count && noteCount_ < config_.maxNotes; i++) {
+        const RoundsNote& n = notes[i];
+        const int64_t noteLength = std::clamp<int64_t>(n.length, 1, loopLength_ - 1);
+        notes_[static_cast<size_t>(noteCount_++)] =
+            Note{wrap(n.start, loopLength_), noteLength, 0, std::clamp(n.note, 0, 127), std::clamp(n.velocity, 1, 127), -1};
+    }
+    state_ = State::Stopped;
+}
+
+// ---------------------------------------------------------------------------
 // Audio
 
 void Looper::writeInput(float sample, int64_t s) {
     const int fade = config_.crossfadeSamples;
     history_[static_cast<size_t>(wrap(s, static_cast<int64_t>(history_.size())))] = sample;
+    if (kind_ == Kind::Midi) return;
 
     if (baseWriting_ && s >= baseStartS_) {
         const int64_t end = loopLength_ > 0 ? loopLength_ + fade : config_.maxLoopSamples + fade;
@@ -347,6 +479,13 @@ float Looper::readLoop(int64_t index) const {
 void Looper::stepFlatten() {
     if (flattenSlot_ < 0) return;
     Layer& layer = layers_[static_cast<size_t>(flattenSlot_)];
+    if (kind_ == Kind::Midi) {
+        // Notes merge at once: they just join the base.
+        for (int i = 0; i < noteCount_; i++) {
+            if (notes_[static_cast<size_t>(i)].layer == flattenSlot_) notes_[static_cast<size_t>(i)].layer = -1;
+        }
+        flattenPos_ = loopLength_;
+    }
     const int64_t end = std::min(loopLength_, flattenPos_ + config_.flattenSamplesPerBlock);
     for (int64_t k = flattenPos_; k < end; k++) {
         if (layerCovers(layer, k)) base_[static_cast<size_t>(k)] += layer.buffer[static_cast<size_t>(k)];
@@ -377,7 +516,7 @@ void Looper::process(const float* in, float* out, int frames, float gain) {
     for (int i = 0; i < frames; i++) {
         const int64_t c = clock_ + i;
         writeInput(in[i], c - inputLatency_);
-        if (audible && loopLength_ > 0) {
+        if (audible && loopLength_ > 0 && kind_ == Kind::Audio) {
             const int64_t index = wrap(c + outputLatency_ - origin_, loopLength_);
             out[i] += readLoop(index) * gain;
         }

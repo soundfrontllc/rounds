@@ -42,6 +42,11 @@ struct LoopInfo: Identifiable, Equatable {
     var gain: Float = 1
     var bars = 0                     // length in bars, 0 until there is a tempo
     var queued = Queued.none
+    var midi = false                 // a MIDI loop (notes), else audio
+    var instrument = Instrument.subBass
+    var notes = 0
+
+    var isDrumLoop: Bool { state != .empty && midi && instrument.isKit }
 
     /// An action waiting for the next bar.
     enum Queued: Int32 {
@@ -79,9 +84,24 @@ final class LooperModel: ObservableObject {
     @Published var selectedLoop = 0 {
         didSet {
             router.select(loop: selectedLoop)
+            followSelectedLoop()
             updateLaunchkeyLEDs()
         }
     }
+    /// What the keys play. Follows the selected MIDI loop; stays put when an
+    /// audio or empty loop is selected.
+    @Published private(set) var keysInstrument = Instrument(rawValue: Int32(UserDefaults.standard.integer(forKey: "keysInstrument")))
+        ?? .subBass {
+        didSet { UserDefaults.standard.set(Int(keysInstrument.rawValue), forKey: "keysInstrument") }
+    }
+    /// The pads' kit while there is no drum loop (a drum loop plays its own).
+    @Published private(set) var kit = Instrument(rawValue: Int32(UserDefaults.standard.integer(forKey: "kit")))
+        .flatMap { $0.isKit ? $0 : nil } ?? .dryKit {
+        didSet { UserDefaults.standard.set(Int(kit.rawValue), forKey: "kit") }
+    }
+    /// Pad last hit (for the window's pad row), and when.
+    @Published var lastHit: (pad: Int, velocity: Int, time: Date)?
+    private var lastRoutes: (ControlRouter.NoteRoute, ControlRouter.NoteRoute)?
     @Published var loops: [LoopInfo] = (0..<Int(ROUNDS_MAX_LOOPS)).map { LoopInfo(id: $0) }
     /// The first loop recorded sets the tempo.
     @Published var baseSeconds: Double = 0
@@ -340,6 +360,95 @@ final class LooperModel: ObservableObject {
     func stop() { router.send(ROUNDS_CMD_STOP) }
     func clear() { router.send(ROUNDS_CMD_CLEAR) }
 
+    // MARK: Instruments
+
+    /// The drum loop the pads record into: the selected loop if it is one,
+    /// else the first.
+    var drumLoop: Int? {
+        if loops[selectedLoop].isDrumLoop { return selectedLoop }
+        return loops.first(where: \.isDrumLoop)?.id
+    }
+
+    /// Keys play the selected loop if it is (or may become) a MIDI loop; an
+    /// audio loop leaves them on their own. Pads go to the drum loop, or make
+    /// the selected empty loop one.
+    private func updateNoteRoutes() {
+        let selected = loops[selectedLoop]
+        // A loop recording audio still becomes MIDI if keys (or pads) come in.
+        let open = selected.state == .empty || (selected.state == .recording && !selected.midi)
+        let keysOnLoop = open || selected.midi
+        let keys = ControlRouter.NoteRoute(loop: keysOnLoop ? Int32(selectedLoop) : -1, instrument: keysInstrument.rawValue)
+        // A selected open loop takes the pads even when a drum loop exists, so
+        // a second beat can be recorded; it starts on the drum loop's kit.
+        let pads: ControlRouter.NoteRoute
+        let padsKit = drumLoop.map { loops[$0].instrument } ?? kit
+        if open {
+            pads = ControlRouter.NoteRoute(loop: Int32(selectedLoop), instrument: padsKit.rawValue)
+        } else if let drumLoop {
+            pads = ControlRouter.NoteRoute(loop: Int32(drumLoop), instrument: loops[drumLoop].instrument.rawValue)
+        } else {
+            pads = ControlRouter.NoteRoute(loop: -1, instrument: kit.rawValue)
+        }
+        guard lastRoutes == nil || lastRoutes! != (keys, pads) else { return }
+        lastRoutes = (keys, pads)
+        router.setNoteRoutes(keys: keys, pads: pads)
+    }
+
+    private func followSelectedLoop() {
+        let loop = loops[selectedLoop]
+        if loop.midi && loop.state != .empty && !loop.instrument.isKit { keysInstrument = loop.instrument }
+        updateNoteRoutes()
+    }
+
+    /// Picks what the keys play; a selected MIDI loop switches to it.
+    func selectInstrument(_ instrument: Instrument) {
+        if instrument.isKit { return selectKit(instrument) }
+        keysInstrument = instrument
+        let loop = loops[selectedLoop]
+        if loop.midi && loop.state != .empty && !loop.instrument.isKit, let engine {
+            rounds_engine_set_instrument(engine, Int32(selectedLoop), instrument.rawValue)
+            loops[selectedLoop].instrument = instrument
+            append("Loop \(selectedLoop + 1)", "Instrument: \(instrument.name)")
+        } else {
+            append("Keys", instrument.name)
+        }
+        updateNoteRoutes()
+    }
+
+    func selectKit(_ newKit: Instrument) {
+        guard newKit.isKit else { return }
+        kit = newKit
+        if let drumLoop, let engine {
+            rounds_engine_set_instrument(engine, Int32(drumLoop), newKit.rawValue)
+            loops[drumLoop].instrument = newKit
+            append("Loop \(drumLoop + 1)", "Kit: \(newKit.name)")
+        } else {
+            append("Pads", newKit.name)
+        }
+        updateNoteRoutes()
+    }
+
+    /// Track ◀ ▶: the next instrument for the keys, or kit if a drum loop is selected.
+    func browseInstrument(_ step: Int) {
+        let selected = loops[selectedLoop]
+        if selected.isDrumLoop {
+            let kits = Instrument.kits
+            let index = kits.firstIndex(of: selected.instrument) ?? 0
+            selectKit(kits[(index + step + kits.count) % kits.count])
+        } else {
+            let synths = Instrument.synths
+            let index = synths.firstIndex(of: keysInstrument) ?? 0
+            selectInstrument(synths[(index + step + synths.count) % synths.count])
+        }
+    }
+
+    /// A pad clicked in the window (plays like the Launchkey's).
+    func hitPad(_ pad: Int) {
+        router.drum(DrumPads.notes[pad], velocity: 100, hostTime: 0)
+        router.drum(DrumPads.notes[pad], velocity: 0, hostTime: 0)
+        lastHit = (pad, 100, Date())
+    }
+
     /// The space bar stands in for the footswitch.
     func spaceBar(down: Bool) { router.pedal(down: down, hostTime: 0) }
 
@@ -382,6 +491,11 @@ final class LooperModel: ObservableObject {
             knobMoved(knob, to: value)
         case let .drumPad(pad, velocity):
             midi.sendToLaunchkey([Launchkey.drumPadLED(pad, color: velocity > 0 ? Launchkey.Color.white : 0)])
+            if velocity > 0 { lastHit = (pad, velocity, Date()) }
+        case .trackLeft(down: true):
+            browseInstrument(-1)
+        case .trackRight(down: true):
+            browseInstrument(1)
         case .padMode(let mode) where mode != 2:
             // Pads were switched away from Session (Shift menu); take them back.
             midi.sendToLaunchkey([Launchkey.padModeSession])
@@ -474,8 +588,16 @@ final class LooperModel: ObservableObject {
             updated[i].gain = l.gain
             updated[i].bars = s.barLength > 0 ? Int(l.loopLength / s.barLength) : 0
             updated[i].queued = LoopInfo.Queued(rawValue: l.queued) ?? .none
+            updated[i].midi = l.kind == Int32(ROUNDS_KIND_MIDI.rawValue)
+            updated[i].instrument = Instrument(rawValue: l.instrument) ?? .subBass
+            updated[i].notes = Int(l.notes)
+            if updated[i].midi && loopState != .empty && !(loops[i].midi && loops[i].state != .empty) {
+                append("Loop \(i + 1)", "Is a MIDI loop: \(updated[i].instrument.name)")
+                if i == selectedLoop && !updated[i].instrument.isKit { keysInstrument = updated[i].instrument }
+            }
         }
         if updated != loops { loops = updated }
+        updateNoteRoutes()
         let selected = loops[selectedLoop]
         state = selected.state
         loopSeconds = selected.state == .recording ? 0 : selected.seconds

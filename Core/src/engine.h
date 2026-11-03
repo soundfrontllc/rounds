@@ -7,6 +7,7 @@
 #include <mutex>
 #include <vector>
 
+#include "instruments.h"
 #include "latency_probe.h"
 #include "looper.h"
 #include "rounds_core.h"
@@ -36,6 +37,10 @@ public:
     // Any non-real-time thread.
     bool send(int loop, RoundsCommand cmd, int64_t sampleTime);
     bool sendAtHostTime(int loop, RoundsCommand cmd, uint64_t hostTime);
+    // A key or pad (see rounds_engine_note). Played one block after it was
+    // pressed, recorded at the moment it was pressed.
+    bool note(int loop, int instrument, int note, int velocity, uint64_t hostTime);
+    bool setInstrument(int loop, int instrument);
     void setLatency(int inputLatency, int outputLatency);
     void setMonitorGain(float gain) { monitorGain_.store(gain); }
     void setLoopGain(int loop, float gain);
@@ -56,6 +61,9 @@ public:
     int transferStatus();
     int64_t takeExport(float* dest, int64_t capacity);
     int64_t maxLoopSamples() const { return loops_[0]->maxLoopSamples(); }
+    bool beginImportNotes(int loop, const RoundsNote* notes, int count, int64_t length, int instrument);
+    int takeExportNotes(RoundsNote* dest, int capacity, int64_t* length, int* instrument);
+    int maxNotes() const { return loops_[0]->maxNotes(); }
 
     double sampleRate() const { return sampleRate_; }
 
@@ -64,7 +72,16 @@ private:
         int32_t loop;
         int32_t cmd;
         int64_t time;
+        int64_t when = -1;       // notes: real time the key was pressed
+        int16_t note = 0;
+        int16_t velocity = 0;
+        int16_t instrument = 0;
     };
+    // Internal commands, beside RoundsCommand.
+    static constexpr int32_t kCmdNote = 100;
+    static constexpr int32_t kCmdInstrument = 101;
+    static constexpr int kKeysPlayer = kLoops;      // keys over an audio loop
+    static constexpr int kPadsPlayer = kLoops + 1;  // pads with no drum loop
 
     // What the UI last heard about each loop, to emit changes only.
     struct Published {
@@ -91,9 +108,16 @@ private:
         std::atomic<int> layerOpen{0};
         std::atomic<float> peak{0.0f};
         std::atomic<int> queued{0};
+        std::atomic<int> kind{0};
+        std::atomic<int> instrument{0};
+        std::atomic<int> notes{0};
     };
 
-    void apply(int loop, int32_t cmd);
+    bool push(const Command& command);
+    int64_t hostToSample(uint64_t hostTime);
+    void apply(const Command& command);
+    void applyNote(const Command& command);
+    void releaseStaleNotes();
     void tap(int loop);
     void stop(int loop);
     void startStopAll();
@@ -119,6 +143,8 @@ private:
     double sampleRate_;
     int maxBlock_;
     std::vector<std::unique_ptr<Looper>> loops_;
+    DrumKits kits_;
+    std::vector<std::unique_ptr<Player>> players_;  // one per loop, then keys and pads
     LatencyProbe probe_;
 
     // Commands: producers serialize on a mutex (never touched by the audio
@@ -141,6 +167,9 @@ private:
     int64_t barLength_ = 0;     // samples
     int64_t gridOrigin_ = 0;    // real time a bar starts at (mod barLength_)
     std::array<Scheduled, kLoops> scheduled_{};
+    std::array<NoteEvent, 256> noteEvents_{};
+    std::array<bool, kLoops> midiAudible_{};   // to release a loop's notes when it stops
+    std::array<int, kLoops> midiNotes_{};      // or loses notes (undo, clear)
     // Click synth.
     float clickPhase_ = 0.0f;
     float clickStep_ = 0.0f;
@@ -167,6 +196,10 @@ private:
     int64_t transferLength_ = 0;
     int64_t transferPos_ = 0;
     int64_t transferRotation_ = 0;  // export: loop index of saved sample 0
+    bool transferMidi_ = false;
+    std::vector<RoundsNote> transferNotes_;
+    int transferNoteCount_ = 0;
+    int transferInstrument_ = 0;
 
     std::array<LoopStats, kLoops> loopStats_;
     std::atomic<int64_t> statBase_{0};

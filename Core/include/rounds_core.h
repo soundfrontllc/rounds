@@ -69,6 +69,32 @@ typedef enum {
     ROUNDS_QUEUED_STOP = 2,
 } RoundsQueued;
 
+// Built-in instruments. Each loop slot owns one; a MIDI loop plays through it.
+typedef enum {
+    ROUNDS_INSTRUMENT_SUB_BASS = 0,
+    ROUNDS_INSTRUMENT_FINGER_BASS = 1,
+    ROUNDS_INSTRUMENT_SYNTH_BASS = 2,
+    ROUNDS_INSTRUMENT_E_PIANO = 3,
+    ROUNDS_INSTRUMENT_WARM_PAD = 4,
+    ROUNDS_INSTRUMENT_MONO_LEAD = 5,
+    ROUNDS_INSTRUMENT_DRY_KIT = 6,      // drum kits: General MIDI notes (kick = 36)
+    ROUNDS_INSTRUMENT_ELECTRO_KIT = 7,
+    ROUNDS_INSTRUMENT_COUNT = 8,
+} RoundsInstrument;
+
+typedef enum {
+    ROUNDS_KIND_AUDIO = 0,
+    ROUNDS_KIND_MIDI = 1,
+} RoundsLoopKind;
+
+// A recorded note: starts `start` samples into the loop, lasts `length` samples.
+typedef struct {
+    int64_t start;
+    int64_t length;
+    int32_t note;
+    int32_t velocity;
+} RoundsNote;
+
 typedef struct {
     int32_t type;          // RoundsEventType
     int32_t loop;          // loop slot, or -1 for engine-wide events
@@ -86,6 +112,9 @@ typedef struct {
     float peak;             // loop's output since last status read, linear
     float gain;
     int32_t queued;         // RoundsQueued
+    int32_t kind;           // RoundsLoopKind (audio until notes are recorded)
+    int32_t instrument;     // RoundsInstrument the slot plays
+    int32_t notes;          // recorded notes (MIDI loops)
 } RoundsLoopStatus;
 
 typedef struct {
@@ -141,6 +170,17 @@ void rounds_engine_set_click_gain(RoundsEngine* engine, float gain);
 // the tempo. Ignored without a tempo. The audio isn't changed.
 void rounds_engine_set_bars(RoundsEngine* engine, int32_t bars);
 
+// Notes (keys and drum pads). `loop` is the slot whose instrument plays the
+// note; -1 just plays `instrument` without recording (keys over an audio loop,
+// or pads with no drum loop). A note into a loop that is recording or
+// overdubbing is recorded. An empty loop that is recording becomes a MIDI loop
+// on its first note, playing `instrument`; a MIDI loop always plays its own.
+// velocity 0 = note off. hostTime is the CoreMIDI timestamp (0 = now).
+int32_t rounds_engine_note(RoundsEngine* engine, int32_t loop, int32_t instrument, int32_t note, int32_t velocity,
+                           uint64_t hostTime);
+// The slot's instrument (switches a MIDI loop's sound).
+void rounds_engine_set_instrument(RoundsEngine* engine, int32_t loop, int32_t instrument);
+
 // Play clicks and measure how long they take to come back in. Needs the
 // output physically looped back to the input (a cable), or a mic near the speaker.
 void rounds_engine_start_calibration(RoundsEngine* engine);
@@ -170,6 +210,15 @@ int32_t rounds_engine_begin_import(RoundsEngine* engine, int32_t loop, const flo
 // for the next transfer.
 int32_t rounds_engine_transfer_status(RoundsEngine* engine);
 int64_t rounds_engine_take_export(RoundsEngine* engine, float* dest, int64_t capacity);
+// MIDI loops: after begin_export reaches 2, fills `dest` with the loop's notes
+// (starts rotated like audio) and returns their count; *length gets the loop
+// length and *instrument its instrument. -1 if the export isn't a MIDI loop.
+int32_t rounds_engine_take_export_notes(RoundsEngine* engine, RoundsNote* dest, int32_t capacity, int64_t* length,
+                                        int32_t* instrument);
+// Loads a MIDI loop; finishes like begin_import (poll transfer_status).
+int32_t rounds_engine_begin_import_notes(RoundsEngine* engine, int32_t loop, const RoundsNote* notes, int32_t count,
+                                         int64_t length, int32_t instrument);
+int32_t rounds_engine_max_notes(RoundsEngine* engine);
 
 // ---------------------------------------------------------------------------
 // Footswitch gestures (pure logic, no audio)

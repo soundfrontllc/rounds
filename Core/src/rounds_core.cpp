@@ -38,6 +38,15 @@ int32_t rounds_engine_send_at_host_time(RoundsEngine* engine, int32_t loop, Roun
     return engine->engine.sendAtHostTime(loop, cmd, hostTime) ? 1 : 0;
 }
 
+int32_t rounds_engine_note(RoundsEngine* engine, int32_t loop, int32_t instrument, int32_t note, int32_t velocity,
+                           uint64_t hostTime) {
+    return engine->engine.note(loop, instrument, note, velocity, hostTime) ? 1 : 0;
+}
+
+void rounds_engine_set_instrument(RoundsEngine* engine, int32_t loop, int32_t instrument) {
+    engine->engine.setInstrument(loop, instrument);
+}
+
 void rounds_engine_set_latency(RoundsEngine* engine, int32_t inputLatency, int32_t outputLatency) {
     engine->engine.setLatency(inputLatency, outputLatency);
 }
@@ -77,6 +86,21 @@ int32_t rounds_engine_begin_import(RoundsEngine* engine, int32_t loop, const flo
 }
 
 int32_t rounds_engine_transfer_status(RoundsEngine* engine) { return engine->engine.transferStatus(); }
+
+int32_t rounds_engine_take_export_notes(RoundsEngine* engine, RoundsNote* dest, int32_t capacity, int64_t* length,
+                                        int32_t* instrument) {
+    int inst = 0;
+    const int count = engine->engine.takeExportNotes(dest, capacity, length, &inst);
+    *instrument = inst;
+    return count;
+}
+
+int32_t rounds_engine_begin_import_notes(RoundsEngine* engine, int32_t loop, const RoundsNote* notes, int32_t count,
+                                         int64_t length, int32_t instrument) {
+    return engine->engine.beginImportNotes(loop, notes, count, length, instrument) ? 1 : 0;
+}
+
+int32_t rounds_engine_max_notes(RoundsEngine* engine) { return engine->engine.maxNotes(); }
 
 int64_t rounds_engine_take_export(RoundsEngine* engine, float* dest, int64_t capacity) {
     return engine->engine.takeExport(dest, capacity);
