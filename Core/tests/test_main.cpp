@@ -1313,6 +1313,152 @@ static void testSessionParts() {
     d.advance(128);
     CHECK(partStatus(d.engine, 2).exists == 1 && d.engine.partLoop(2, 3) == 5 && d.engine.partLoop(2, 0) == 16,
           "part 3 made, slot 4 plays loop 6");
+    // An empty part for imported stems avoids loop 6 (part 3 uses it) and doesn't switch.
+    d.engine.addEmptyPart(0);
+    d.engine.addEmptyPart(1);
+    d.advance(128);
+    CHECK(partStatus(d.engine, 1).exists == 1 && status(d.engine).part == 0, "empty part 2 made, still in part 1");
+    bool fresh = true;
+    for (int slot = 0; slot < 8; slot++) {
+        const int id = d.engine.partLoop(1, slot);
+        fresh = fresh && id != 5 && id >= 0 && poolStatus(d.engine, id).state == ROUNDS_LOOP_EMPTY;
+        for (int other = 0; other < 8; other++) fresh = fresh && id != d.engine.partLoop(0, other) && id != d.engine.partLoop(2, other);
+    }
+    CHECK(fresh, "its loops are empty and no other part's");
+}
+
+// ---------------------------------------------------------------------------
+// Whole song (milestone 6)
+
+static RoundsStatus songStatus(Engine& engine) { return status(engine); }
+
+static void testSongTiming() {
+    std::printf("Song: plays in time from its bars, sets the grid, stops and jumps on bar lines\n");
+    const int in = 200, outLat = 300;
+    Keys k(in, outLat);
+    k.engine.setQuantize(true);
+    const int64_t bar = 24000, downbeat = 5000;
+    const int bars = 12;
+    // One stem: a click on every downbeat, louder on bar 5.
+    std::vector<float> stem(static_cast<size_t>(downbeat + bars * bar), 0.0f);
+    for (int b = 0; b < bars; b++) {
+        for (int j = 0; j < 32; j++) stem[static_cast<size_t>(downbeat + b * bar + j)] = b == 4 ? 0.9f : 0.5f;
+    }
+    const float* stems[] = {stem.data()};
+    CHECK(k.engine.loadSong(stems, 1, static_cast<int64_t>(stem.size()), bar, downbeat), "song loads");
+    k.run(256);
+    CHECK(songStatus(k.engine).songLoaded == 1 && status(k.engine).barLength == bar, "the song sets the bar length");
+    k.engine.setSongLane(5, 0);
+    k.run(128);
+
+    // Play: bar 1 is heard in full, outLat after the press lands.
+    k.runTo(20000);
+    const int64_t pressed = k.now;
+    k.engine.send(-1, ROUNDS_CMD_START_STOP_ALL, -1);
+    k.run(128);
+    const int64_t top = pressed + outLat;  // real time bar 1 is heard
+    // What is heard at real time t was written at clock t - outLat.
+    for (int b = 0; b < 3; b++) {
+        const int64_t expected = top + b * bar - outLat;
+        k.runTo(expected + 2000);
+        CHECK(k.onset(expected - 1000, expected + 1000) == expected, "bar %d heard on time (off by %lld)", b + 1,
+              (long long)(k.onset(expected - 1000, expected + 1000) - expected));
+    }
+    CHECK(status(k.engine).songBar == 3, "status says bar 3 (%d)", status(k.engine).songBar);
+
+    // A loop recorded over it snaps to the song's bars and starts on its bar line.
+    k.tap(0, top + 3 * bar + 2000 - outLat);           // just after bar 4's line: counts for it
+    k.tap(0, top + 5 * bar - 3000 - outLat);           // close it ~2 bars later
+    k.run(256);
+    CHECK(k.s(0).loopLength == 2 * bar, "loop is 2 of the song's bars (%lld)", (long long)k.s(0).loopLength);
+
+    // Stop mid-bar: the song stops on the next bar line and Play carries on from there.
+    k.runTo(top + 6 * bar + bar / 2 - outLat);
+    k.engine.send(-1, ROUNDS_CMD_START_STOP_ALL, -1);
+    k.run(128);
+    CHECK(status(k.engine).songPlaying == 1, "still playing until the bar line");
+    k.runTo(top + 7 * bar - outLat + 1000);
+    CHECK(status(k.engine).songPlaying == 0 && status(k.engine).songBar == 8, "stopped at bar 8's line (bar %d)",
+          status(k.engine).songBar);
+    const int64_t silentFrom = top + 7 * bar - outLat;
+    CHECK(k.peak(silentFrom + 100, silentFrom + 3000) < 1e-4f, "nothing after the stop");
+
+    // Jump to bar 5 and play: its (loud) downbeat is heard on the bar line.
+    k.engine.setSongBar(5);
+    k.run(128);
+    CHECK(status(k.engine).songBar == 5, "start bar 5");
+    const int64_t pressed2 = k.now;
+    k.engine.send(-1, ROUNDS_CMD_START_STOP_ALL, -1);
+    k.run(128);
+    const int64_t top2 = pressed2 + outLat;
+    k.runTo(top2 + 2000);
+    const int64_t loud = top2 - outLat;
+    CHECK(k.onset(loud - 1000, loud + 1000) == loud && k.peak(loud, loud + 32) > 0.8f, "bar 5 heard at the top (off by %lld)",
+          (long long)(k.onset(loud - 1000, loud + 1000) - loud));
+    CHECK(k.s(0).state == ROUNDS_LOOP_PLAYING && k.s(0).playPosition == mod(k.now - top2, 2 * bar),
+          "the loop restarted with it, from its top (at %lld, expected %lld)", (long long)k.s(0).playPosition,
+          (long long)mod(k.now - top2, 2 * bar));
+
+    // While playing, a jump lands on the next bar line.
+    k.runTo(top2 + bar / 3);
+    k.engine.setSongBar(2);
+    k.run(128);
+    const int64_t line = top2 + bar - outLat;  // bar 6's line, now bar 2
+    k.runTo(line + 2000);
+    CHECK(k.onset(line - 1000, line + 1000) == line && k.peak(line, line + 32) < 0.6f, "jumped to bar 2 on the bar line");
+
+    // Gain and unload.
+    k.engine.setSongGain(0, 0.0f);
+    k.runTo(line + bar + 2000);
+    CHECK(k.peak(line + bar - 50, line + bar + 500) < 0.1f || k.s(0).state == ROUNDS_LOOP_PLAYING, "gain 0 mutes the song");
+    k.engine.loadSong(nullptr, 0, 0, 0, 0);
+    k.run(256);
+    CHECK(status(k.engine).songLoaded == 0 && status(k.engine).barLength == bar, "unloaded; the loop keeps the tempo");
+}
+
+static void testSongLanes() {
+    std::printf("Song lanes: only stems in a lane are heard; a stem lane only plays; clear takes the stem out\n");
+    Keys k(0, 0);
+    const int64_t bar = 24000;
+    std::vector<float> a(static_cast<size_t>(8 * bar), 0.25f), b(static_cast<size_t>(8 * bar), 0.5f);
+    const float* stems[] = {a.data(), b.data()};
+    k.engine.loadSong(stems, 2, 8 * bar, bar, 0);
+    k.run(256);
+    k.engine.setSongLane(0, 0);
+    k.run(128);
+    CHECK(k.s(0).songStem == 0 && k.s(1).songStem == -1, "stem 0 in lane 1, lane 2 empty");
+    k.engine.send(-1, ROUNDS_CMD_START_STOP_ALL, -1);
+    k.run(4096);
+    CHECK(std::fabs(k.peak(k.now - 1000, k.now) - 0.25f) < 1e-4f, "only the stem in a lane is heard (%f)", k.peak(k.now - 1000, k.now));
+    CHECK(k.s(0).peak > 0.2f, "the lane shows the stem's level");
+
+    // Moving stem 1 into lane 2, then stem 1 into lane 3: one lane each.
+    k.engine.setSongLane(1, 1);
+    k.engine.setSongLane(2, 1);
+    k.run(1024);
+    CHECK(k.s(1).songStem == -1 && k.s(2).songStem == 1, "a stem sits in one lane");
+    CHECK(std::fabs(k.peak(k.now - 500, k.now) - 0.75f) < 1e-4f, "both stems heard");
+
+    // Tap and notes on a stem lane don't record.
+    k.tap(0, k.now);
+    k.note(0, ROUNDS_INSTRUMENT_SUB_BASS, 48, 100, k.now);
+    k.note(0, ROUNDS_INSTRUMENT_SUB_BASS, 48, 0, k.now + 500);
+    k.run(4096);
+    CHECK(k.s(0).state == ROUNDS_LOOP_EMPTY && k.s(0).songStem == 0, "a stem lane doesn't record");
+
+    // Clear takes the stem out; the lane is a normal lane again.
+    k.command(0, ROUNDS_CMD_CLEAR);
+    k.run(1024);
+    CHECK(k.s(0).songStem == -1, "clear takes the stem out of the lane");
+    CHECK(std::fabs(k.peak(k.now - 500, k.now) - 0.5f) < 0.02f, "and it is no longer heard (the played bass note may still ring) (%f)", k.peak(k.now - 500, k.now));
+    k.tap(0, k.now);
+    k.run(1024);
+    CHECK(k.s(0).state == ROUNDS_LOOP_RECORDING, "the lane records again");
+
+    // Unloading empties the lanes.
+    k.engine.loadSong(nullptr, 0, 0, 0, 0);
+    k.run(256);
+    CHECK(k.s(2).songStem == -1, "unloading empties the lanes");
 }
 
 int main() {
@@ -1347,6 +1493,8 @@ int main() {
     testPartSwitchClosesAndStops();
     testSharedLayerPool();
     testSessionParts();
+    testSongTiming();
+    testSongLanes();
     std::printf("\n%d checks, %d failed\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

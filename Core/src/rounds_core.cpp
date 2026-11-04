@@ -75,9 +75,28 @@ void rounds_engine_get_pool_loop_status(RoundsEngine* engine, int32_t loopID, Ro
     engine->engine.getPoolLoopStatus(loopID, out);
 }
 
+int32_t rounds_engine_load_song(RoundsEngine* engine, const float* const* stems, int32_t count, int64_t length,
+                                int64_t barLength, int64_t downbeat) {
+    return engine->engine.loadSong(stems, count, length, barLength, downbeat) ? 1 : 0;
+}
+
+void rounds_engine_unload_song(RoundsEngine* engine) { engine->engine.loadSong(nullptr, 0, 0, 0, 0); }
+
+void rounds_engine_set_song_gain(RoundsEngine* engine, int32_t stem, float gain) {
+    engine->engine.setSongGain(stem, gain);
+}
+
+void rounds_engine_set_song_bar(RoundsEngine* engine, int32_t bar) { engine->engine.setSongBar(bar); }
+
+void rounds_engine_set_song_lane(RoundsEngine* engine, int32_t slot, int32_t stem) {
+    engine->engine.setSongLane(slot, stem);
+}
+
 void rounds_engine_switch_part(RoundsEngine* engine, int32_t part) { engine->engine.switchPart(part); }
 
 void rounds_engine_new_part(RoundsEngine* engine) { engine->engine.newPart(); }
+
+void rounds_engine_add_empty_part(RoundsEngine* engine, int32_t part) { engine->engine.addEmptyPart(part); }
 
 void rounds_engine_set_shared(RoundsEngine* engine, int32_t loopID, int32_t shared) {
     engine->engine.setShared(loopID, shared != 0);

@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject var model: LooperModel
     @FocusState private var focused: Bool
+    @State private var importingStems = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -13,6 +14,7 @@ struct ContentView: View {
             HStack(alignment: .top, spacing: 16) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
+                        if model.song != nil { SongPanel() }
                         PartsStrip()
                         LoopLanes()
                         SoundsPanel()
@@ -38,6 +40,9 @@ struct ContentView: View {
             model.spaceBar(down: press.phase == .down)
             return .handled
         }
+        .sheet(isPresented: $importingStems) {
+            StemImportView(stems: model.stemImport).environmentObject(model)
+        }
     }
 
     // MARK: Header
@@ -53,6 +58,9 @@ struct ContentView: View {
             Button("Save") { model.saveSession() }
                 .disabled(!model.audioRunning || model.sessionBusy)
                 .help("Save the loops and volumes to a session folder (⌘S)")
+            Button("Import song → stems") { importingStems = true }
+                .disabled(!model.audioRunning || model.sessionBusy)
+                .help("Split a song into drums, bass, guitar, piano, vocals and other, and loop bars of it as a new part")
             Spacer()
             Picker("Interface", selection: $model.deviceID) {
                 ForEach(model.devices) { device in
@@ -118,7 +126,8 @@ struct ContentView: View {
 
     /// The base loop may be in another part.
     private var baseName: String {
-        model.baseLoop >= 0 ? "loop \(model.baseLoop + 1)" : "the first loop"
+        if model.song != nil { return "the song" }
+        return model.baseLoop >= 0 ? "loop \(model.baseLoop + 1)" : "the first loop"
     }
 
     private var tempoText: String {
@@ -136,10 +145,20 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline) {
                 Text("Loop \(model.selectedLoop + 1)").font(.headline)
-                StateBadge(state: model.state)
-                Toggle("Shared", isOn: Binding(get: { model.loops[model.selectedLoop].shared }, set: { model.setShared($0) }))
-                    .disabled(!model.audioRunning)
-                    .help("A shared loop (like the beat) stays the same loop in new parts; other loops are copied")
+                if let stem = selectedStem {
+                    Text("Song · \(stem)")
+                        .font(.headline)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 5)
+                        .background(Capsule().fill(Color.teal.opacity(0.18)))
+                        .foregroundStyle(Color.teal)
+                        .help("This lane plays the song's \(stem) stem in every part. Clear takes it out.")
+                } else {
+                    StateBadge(state: model.state)
+                    Toggle("Shared", isOn: Binding(get: { model.loops[model.selectedLoop].shared }, set: { model.setShared($0) }))
+                        .disabled(!model.audioRunning)
+                        .help("A shared loop (like the beat) stays the same loop in new parts; other loops are copied")
+                }
                 Spacer()
                 Text(lengthText).font(.system(.title3, design: .monospaced))
                 Text("· \(model.layers) layer\(model.layers == 1 ? "" : "s")").foregroundStyle(.secondary)
@@ -176,7 +195,15 @@ struct ContentView: View {
         .background(RoundedRectangle(cornerRadius: 12).fill(Color(nsColor: .controlBackgroundColor)))
     }
 
+    /// The song stem in the selected lane, if any.
+    private var selectedStem: String? {
+        let stem = model.loops[model.selectedLoop].stem
+        guard stem >= 0, let song = model.song, stem < song.stems.count else { return nil }
+        return song.stems[stem]
+    }
+
     private var lengthText: String {
+        if selectedStem != nil, let song = model.song { return LooperModel.barsText(song.bars) }
         switch model.state {
         case .empty: return "—"
         case .recording: return String(format: "%.2f s", model.recordedSeconds)
@@ -194,14 +221,18 @@ struct ContentView: View {
 
     private var controls: some View {
         HStack(spacing: 10) {
-            Button(action: model.tap) { Label(tapLabel, systemImage: "record.circle") }
-                .controlSize(.large)
-            Button(action: model.undo) { Label("Undo", systemImage: "arrow.uturn.backward") }
-                .controlSize(.large)
-            Button(action: model.stop) { Label("Stop", systemImage: "stop.fill") }
-                .controlSize(.large)
-            Button(role: .destructive, action: model.clear) { Label("Clear", systemImage: "trash") }
-                .controlSize(.large)
+            Group {
+                Button(action: model.tap) { Label(tapLabel, systemImage: "record.circle") }
+                Button(action: model.undo) { Label("Undo", systemImage: "arrow.uturn.backward") }
+                Button(action: model.stop) { Label("Stop", systemImage: "stop.fill") }
+            }
+            .controlSize(.large)
+            .disabled(selectedStem != nil)
+            Button(role: .destructive, action: model.clear) {
+                Label(selectedStem == nil ? "Clear" : "Remove stem", systemImage: "trash")
+            }
+            .controlSize(.large)
+            .help(selectedStem == nil ? "Clear the loop" : "Take the stem out of this lane, freeing it for a loop")
             Spacer()
             Toggle("Event log", isOn: $model.showLog).toggleStyle(.switch)
         }
@@ -271,6 +302,7 @@ struct LoopLanes: View {
     }
 
     private var baseText: String {
+        if model.song != nil { return "Song stems play in their lanes; loops snap to the song's bars" }
         guard model.bars > 0 else { return "The first loop recorded sets the tempo; the others snap to whole bars" }
         return "Loops snap to 1, 2, 4, 8 … bars"
     }
@@ -282,11 +314,58 @@ struct LoopLane: View {
     let selected: Bool
 
     var body: some View {
+        Group {
+            if loop.stem >= 0, let song = model.song, loop.stem < song.stems.count {
+                stemLane(song)
+            } else {
+                loopLane
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(RoundedRectangle(cornerRadius: 6).fill(selected ? Color.accentColor.opacity(0.15) : .clear))
+    }
+
+    /// A lane playing one of the song's stems.
+    private func stemLane(_ song: SongInfo) -> some View {
+        let stem = loop.stem
+        let muted = song.muted[stem]
+        return HStack(spacing: 10) {
+            number(filled: true)
+            Text(muted ? "Muted" : song.playing ? "Song" : "Song (stopped)")
+                .font(.callout)
+                .foregroundStyle(muted ? Color.secondary : song.playing ? Color.green : .orange)
+                .frame(width: 110, alignment: .leading)
+            Text(LooperModel.barsText(song.bars))
+                .font(.system(.callout, design: .monospaced))
+                .frame(width: 120, alignment: .leading)
+            HStack(spacing: 6) {
+                Text("♫ \(song.stems[stem]) stem").foregroundStyle(Color.teal).lineLimit(1)
+                Button(muted ? "Unmute" : "Mute") { model.toggleSongMute(stem) }
+                    .controlSize(.small)
+            }
+            .font(.callout)
+            .frame(width: 200, alignment: .leading)
+            StemWaveform(peaks: stem < model.songOverviews.count ? model.songOverviews[stem] : [],
+                         position: song.position, color: loop.color, dimmed: muted)
+                .frame(height: 18)
+            LevelMeter(label: "", level: loop.level).frame(width: 70)
+            Slider(value: Binding(get: { Double(song.gains[stem]) }, set: { model.setSongGain(stem, Float($0)) }), in: 0...1)
+                .frame(width: 110)
+                .help("The \(song.stems[stem]) stem's volume (knob \(loop.id + 1) on the Launchkey)")
+        }
+    }
+
+    private func number(filled: Bool) -> some View {
+        Text("\(loop.id + 1)")
+            .font(.system(.callout, design: .monospaced).weight(.semibold))
+            .frame(width: 22, height: 22)
+            .background(Circle().fill(filled ? loop.color : Color.secondary.opacity(0.2)))
+    }
+
+    private var loopLane: some View {
         HStack(spacing: 10) {
-            Text("\(loop.id + 1)")
-                .font(.system(.callout, design: .monospaced).weight(.semibold))
-                .frame(width: 22, height: 22)
-                .background(Circle().fill(loop.state == .empty ? Color.secondary.opacity(0.2) : loop.color))
+            number(filled: loop.state != .empty)
             Text(stateText)
                 .font(.callout)
                 .foregroundStyle(loop.queued == .none ? loop.state.color : .orange)
@@ -316,9 +395,6 @@ struct LoopLane: View {
                 .frame(width: 110)
                 .help("Volume (knob \(loop.id + 1) on the Launchkey)")
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
-        .background(RoundedRectangle(cornerRadius: 6).fill(selected ? Color.accentColor.opacity(0.15) : .clear))
     }
 
     private var lengthText: String {
@@ -347,6 +423,90 @@ struct LoopLane: View {
         case .tap: return loop.state == .empty ? "Record next bar" : "Play next bar"
         case .stop: return "Stop next bar"
         }
+    }
+}
+
+// MARK: - Song
+
+/// The whole song playing along: where it is, and a strip to pick the bar
+/// Play starts from (its stems are in the loop lanes).
+struct SongPanel: View {
+    @EnvironmentObject var model: LooperModel
+
+    var body: some View {
+        if let song = model.song {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 10) {
+                    Text("Song").font(.headline)
+                    Text(song.name).lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    Text(song.playing ? "Bar \(song.bar) of \(song.bars)" : "Starts at bar \(song.bar) of \(song.bars)")
+                        .font(.system(.callout, design: .monospaced))
+                        .foregroundStyle(song.playing ? Color.green : .secondary)
+                    Button("Unload") { model.unloadSong() }
+                        .help("Take the song and its stems out of the lanes")
+                }
+                SongStrip(song: song) { model.setSongBar($0) }
+                    .frame(height: 26)
+                Text("Its stems play in the lanes below. Play starts the song and the loops together from the bar shown. "
+                     + "Click the strip to pick a bar (while playing, it jumps there at the next bar line).")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 12).fill(Color(nsColor: .controlBackgroundColor)))
+        }
+    }
+}
+
+/// A stem's waveform across the whole song, with the playhead.
+struct StemWaveform: View {
+    let peaks: [Float]
+    let position: Double
+    let color: Color
+    let dimmed: Bool
+
+    var body: some View {
+        Canvas { context, size in
+            guard !peaks.isEmpty else { return }
+            let loudest = max(peaks.max() ?? 1, 0.01)
+            let width = size.width / CGFloat(peaks.count)
+            var path = Path()
+            for (i, p) in peaks.enumerated() {
+                let h = max(1, CGFloat(p / loudest) * size.height)
+                path.addRect(CGRect(x: CGFloat(i) * width, y: (size.height - h) / 2, width: max(1, width), height: h))
+            }
+            context.fill(path, with: .color(color.opacity(dimmed ? 0.25 : 0.7)))
+            let x = CGFloat(position) * size.width
+            context.fill(Path(CGRect(x: x - 1, y: 0, width: 2, height: size.height)), with: .color(.primary))
+        }
+        .background(RoundedRectangle(cornerRadius: 3).fill(Color(nsColor: .textBackgroundColor)))
+    }
+}
+
+struct SongStrip: View {
+    let song: SongInfo
+    let pick: (Int) -> Void
+
+    var body: some View {
+        GeometryReader { geo in
+            Canvas { context, size in
+                let bars = max(1, song.bars)
+                let every = size.width / CGFloat(bars) < 4 ? 8 : 1
+                for bar in stride(from: 0, through: bars, by: every) {
+                    let x = CGFloat(bar) / CGFloat(bars) * size.width
+                    context.fill(Path(CGRect(x: x, y: 0, width: 1, height: size.height)),
+                                 with: .color(.secondary.opacity(bar % 16 == 0 ? 0.5 : 0.18)))
+                }
+                let at = CGFloat(song.bar - 1) / CGFloat(bars) * size.width
+                context.fill(Path(CGRect(x: at, y: 0, width: max(2, size.width / CGFloat(bars)), height: size.height)),
+                             with: .color(song.playing ? .green.opacity(0.6) : .accentColor.opacity(0.5)))
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { location in
+                pick(Int(location.x / geo.size.width * CGFloat(song.bars)) + 1)
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 4).fill(Color(nsColor: .textBackgroundColor)))
     }
 }
 

@@ -31,6 +31,7 @@ typedef struct RoundsEngine RoundsEngine;
 // Commands, notes and loop status take a slot of the current part; gains,
 // sharing and session transfers take a loop ID.
 #define ROUNDS_MAX_PARTS 8
+#define ROUNDS_MAX_SONG_STEMS 6
 #define ROUNDS_POOL_LOOPS 64  // ROUNDS_MAX_LOOPS * ROUNDS_MAX_PARTS (a plain number so Swift imports it)
 
 typedef enum {
@@ -129,6 +130,7 @@ typedef struct {
     int32_t notes;          // recorded notes (MIDI loops)
     int32_t loopID;         // the engine loop this slot plays
     int32_t shared;         // 1: "New part" keeps this loop instead of copying it
+    int32_t songStem;       // the song stem in this lane (peak is then the stem's), or -1
 } RoundsLoopStatus;
 
 typedef struct {
@@ -156,6 +158,11 @@ typedef struct {
     int32_t part;           // the part playing
     int32_t nextPart;       // part waiting for the end of the cycle, -1 if none
     int64_t partSwitchIn;   // samples until it is heard, -1 if none
+    int32_t songLoaded;     // a whole song (imported stems) is loaded; it sets the tempo
+    int32_t songPlaying;
+    int64_t songLength;     // samples
+    int64_t songPosition;   // song sample heard now (while playing), else where Play starts it
+    int32_t songBar;        // bar heard now (from 1), or the bar Play starts from
 } RoundsStatus;
 
 // maxLoopSeconds bounds memory per loop slot: all loop and layer buffers are
@@ -218,6 +225,9 @@ void rounds_engine_switch_part(RoundsEngine* engine, int32_t part);
 // switch_part. Emits ROUNDS_EVENT_PART_CREATED.
 void rounds_engine_new_part(RoundsEngine* engine);
 void rounds_engine_set_shared(RoundsEngine* engine, int32_t loopID, int32_t shared);
+// Makes `part` (if it doesn't exist yet) with 8 empty loops no other part
+// uses, without switching to it; e.g. for imported stems. Emits PART_CREATED.
+void rounds_engine_add_empty_part(RoundsEngine* engine, int32_t part);
 void rounds_engine_get_part_status(RoundsEngine* engine, int32_t part, RoundsPartStatus* out);
 // The loop ID in a part's slot (as of the last processed block).
 int32_t rounds_engine_part_loop(RoundsEngine* engine, int32_t part, int32_t slot);
@@ -225,6 +235,26 @@ int32_t rounds_engine_part_loop(RoundsEngine* engine, int32_t part, int32_t slot
 // then set_part_loop makes the saved parts (creating them) before loading loops.
 void rounds_engine_reset(RoundsEngine* engine);
 void rounds_engine_set_part_loop(RoundsEngine* engine, int32_t part, int32_t slot, int32_t loopID);
+
+// A whole song: imported stems (mono, at the engine's rate, up to
+// ROUNDS_MAX_SONG_STEMS) playing in time with the loops, across parts.
+// While loaded it sets the tempo and bar grid: `barLength` samples a bar, bar 1
+// at song sample `downbeat` (stretch the song to the session's bar length
+// first when loops already set one). Copies the stems; returns 0 if they are
+// unusable. Play (START_STOP_ALL) starts it with the loops from its start bar;
+// stop lands on the next bar like the loops. Loading replaces any song.
+int32_t rounds_engine_load_song(RoundsEngine* engine, const float* const* stems, int32_t count, int64_t length,
+                                int64_t barLength, int64_t downbeat);
+void rounds_engine_unload_song(RoundsEngine* engine);
+void rounds_engine_set_song_gain(RoundsEngine* engine, int32_t stem, float gain);
+// Where Play starts the song (bar from 1); while it plays, it jumps there at the next bar line.
+void rounds_engine_set_song_bar(RoundsEngine* engine, int32_t bar);
+// Puts song stem `stem` in lane `slot` (in every part), or empties the lane
+// (stem -1). Only stems in a lane are heard. A stem lane only plays: tap,
+// stop and undo there do nothing, keys and pads aren't recorded into it, and
+// CLEAR takes the stem out. Loading or unloading a song empties every lane.
+// Put a stem only in a lane that is empty in every part.
+void rounds_engine_set_song_lane(RoundsEngine* engine, int32_t slot, int32_t stem);
 
 // Play clicks and measure how long they take to come back in. Needs the
 // output physically looped back to the input (a cable), or a mic near the speaker.

@@ -37,6 +37,9 @@ public:
     static constexpr int kLayers = 24;                // shared overdub layers
 
     Engine(double sampleRate, double maxLoopSeconds, int maxBlockFrames);
+    ~Engine();
+    Engine(const Engine&) = delete;
+    Engine& operator=(const Engine&) = delete;
 
     // Real-time.
     void process(const float* input, float* outL, float* outR, int frames);
@@ -66,9 +69,16 @@ public:
     int partLoop(int part, int slot) const;
     bool switchPart(int part);
     bool newPart();
+    bool addEmptyPart(int part);
     bool setShared(int loopID, bool shared);
     bool reset();
     bool setPartLoop(int part, int slot, int loopID);
+    // Song (see rounds_engine_load_song). count 0 unloads.
+    bool loadSong(const float* const* stems, int count, int64_t length, int64_t barLength, int64_t downbeat);
+    void setSongGain(int stem, float gain);
+    bool setSongBar(int bar);
+    bool setSongLane(int slot, int stem);
+    static constexpr int kSongStems = ROUNDS_MAX_SONG_STEMS;
     bool pollEvent(RoundsEvent* out) { return events_.pop(*out); }
 
     // Session save/load: one loop at a time through a buffer the audio thread
@@ -103,6 +113,9 @@ private:
     static constexpr int32_t kCmdShared = 104;
     static constexpr int32_t kCmdReset = 105;
     static constexpr int32_t kCmdPartLoop = 106;   // loop = part, note = slot, instrument = loop ID
+    static constexpr int32_t kCmdEmptyPart = 107;  // loop = part
+    static constexpr int32_t kCmdSongBar = 108;    // loop = bar
+    static constexpr int32_t kCmdSongLane = 109;   // loop = slot, note = stem or -1
     static constexpr int kKeysPlayer = kPool;      // keys over an audio loop
     static constexpr int kPadsPlayer = kPool + 1;  // pads with no drum loop
     static constexpr int64_t kCopySlice = 65536;   // samples copied per block for a new part
@@ -120,6 +133,18 @@ private:
     struct Scheduled {
         int action = kNone;
         int64_t time = 0;
+    };
+
+    // A whole song. Built by other threads, handed to the audio thread through
+    // incomingSong_ and back through retiredSong_ to be freed off it. A song
+    // of length 0 means "unload".
+    struct Song {
+        std::array<std::vector<float>, ROUNDS_MAX_SONG_STEMS> stems;
+        int count = 0;
+        int64_t length = 0;
+        int64_t barLength = 0;
+        int64_t downbeat = 0;
+        int64_t barStart(int bar) const { return downbeat + static_cast<int64_t>(bar - 1) * barLength; }
     };
 
     // A loop being copied into a new part, a slice per block.
@@ -163,11 +188,20 @@ private:
     void scheduleSwitch();
     void fireSwitch();
     void createPart();
+    void createEmptyPart(int part);
     int freeLoopFor(int part, int slot) const;
     void resetParts();
     void stepCopies();
     void keepLayersFree();
     void resyncPublished();
+    void takeSong();
+    void startSong(int64_t at);
+    void stopSong();
+    void emptyLanes();
+    void renderSong(float* out, int frames, int64_t start);
+    int songBarAt(int64_t index) const;
+    int64_t nextBarLine(int64_t now) const;
+    void freeRetiredSong();
     void releaseStaleNotes();
     // Below, `loop` is a loop ID.
     void tap(int loop);
@@ -233,6 +267,21 @@ private:
     int64_t switchOrigin_ = 0;   // real time the new part's loops start (switchAt_ + output latency)
     bool switchNow_ = false;     // nothing was playing: switch without starting anything
     std::array<Copy, kLoops> copies_{};
+    // Song (audio thread).
+    Song* song_ = nullptr;
+    bool songPlaying_ = false;
+    int64_t songOrigin_ = 0;    // real time song sample 0 is heard
+    int songCue_ = 1;           // bar Play starts it from
+    int64_t songStopAt_ = -1;   // clock time of a stop waiting for the bar line
+    int64_t songJumpAt_ = -1;   // clock time of a jump to songJumpBar_
+    int songJumpBar_ = 1;
+    std::atomic<Song*> incomingSong_{nullptr};
+    std::atomic<Song*> retiredSong_{nullptr};
+    std::mutex songMutex_;      // loaders only (never the audio thread)
+    std::array<std::atomic<float>, kSongStems> songGain_;
+    std::array<int, kLoops> laneStem_{};          // stem in each lane, -1 for none
+    std::array<std::atomic<int>, kLoops> statLaneStem_;
+    std::array<std::atomic<float>, kSongStems> stemPeak_;
     // Click synth.
     float clickPhase_ = 0.0f;
     float clickStep_ = 0.0f;
@@ -270,6 +319,11 @@ private:
     std::atomic<int> statPart_{0};
     std::atomic<int> statNextPart_{-1};
     std::atomic<int64_t> statSwitchIn_{-1};
+    std::atomic<int> statSongLoaded_{0};
+    std::atomic<int> statSongPlaying_{0};
+    std::atomic<int64_t> statSongLength_{0};
+    std::atomic<int64_t> statSongPosition_{0};
+    std::atomic<int> statSongBar_{1};
     std::atomic<int64_t> statBase_{0};
     std::atomic<int> statBaseLoop_{-1};
     std::atomic<int> statBaseID_{-1};
