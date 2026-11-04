@@ -48,11 +48,14 @@ Engine::Engine(double sampleRate, double maxLoopSeconds, int maxBlockFrames)
     for (int i = 0; i < kPool; i++) {
         loops_.push_back(std::make_unique<Looper>(config, layerPool_.get()));
         loopGain_[static_cast<size_t>(i)].store(1.0f);
+        loopMute_[static_cast<size_t>(i)].store(false);
+        loopPan_[static_cast<size_t>(i)].store(0.0f);
     }
     for (int i = 0; i < kPool + 2; i++) players_.push_back(std::make_unique<Player>(sampleRate, &kits_));
     resetParts();
     for (int i = 0; i < kParts * kLoops; i++) statPartLoops_[static_cast<size_t>(i)].store(i);
     for (auto& gain : songGain_) gain.store(1.0f);
+    for (auto& pan : songPan_) pan.store(0.0f);
     for (auto& peak : stemPeak_) peak.store(0.0f);
     for (auto& stem : statLaneStem_) stem.store(-1);
     laneStem_.fill(-1);
@@ -60,6 +63,8 @@ Engine::Engine(double sampleRate, double maxLoopSeconds, int maxBlockFrames)
     transferNotes_.resize(static_cast<size_t>(loops_[0]->maxNotes()));
     zeros_.assign(static_cast<size_t>(maxBlockFrames), 0.0f);
     scratch_.assign(static_cast<size_t>(maxBlockFrames), 0.0f);
+    loopsL_.assign(static_cast<size_t>(maxBlockFrames), 0.0f);
+    loopsR_.assign(static_cast<size_t>(maxBlockFrames), 0.0f);
     transferBuffer_.assign(static_cast<size_t>(loops_[0]->maxLoopSamples()), 0.0f);
 }
 
@@ -140,6 +145,22 @@ void Engine::setLoopGain(int loopID, float gain) {
     if (validID(loopID)) loopGain_[static_cast<size_t>(loopID)].store(std::max(0.0f, gain));
 }
 
+void Engine::setLoopMute(int loopID, bool muted) {
+    if (validID(loopID)) loopMute_[static_cast<size_t>(loopID)].store(muted);
+}
+
+void Engine::setLoopPan(int loopID, float pan) {
+    if (validID(loopID)) loopPan_[static_cast<size_t>(loopID)].store(std::clamp(pan, -1.0f, 1.0f));
+}
+
+// A copied loop keeps its volume, mute and pan.
+void Engine::copyMix(int from, int to) {
+    const size_t f = static_cast<size_t>(from), t = static_cast<size_t>(to);
+    loopGain_[t].store(loopGain_[f].load(std::memory_order_relaxed), std::memory_order_relaxed);
+    loopMute_[t].store(loopMute_[f].load(std::memory_order_relaxed), std::memory_order_relaxed);
+    loopPan_[t].store(loopPan_[f].load(std::memory_order_relaxed), std::memory_order_relaxed);
+}
+
 bool Engine::loadSong(const float* const* stems, int count, int64_t length, int64_t barLength, int64_t downbeat) {
     if (count < 0 || count > kSongStems) return false;
     if (count > 0 && (!stems || length <= 0 || barLength <= 0 || downbeat < 0 || downbeat >= length)) return false;
@@ -162,6 +183,10 @@ bool Engine::loadSong(const float* const* stems, int count, int64_t length, int6
 }
 
 void Engine::freeRetiredSong() { delete retiredSong_.exchange(nullptr, std::memory_order_acq_rel); }
+
+void Engine::setSongPan(int stem, float pan) {
+    if (stem >= 0 && stem < kSongStems) songPan_[static_cast<size_t>(stem)].store(std::clamp(pan, -1.0f, 1.0f));
+}
 
 void Engine::setSongGain(int stem, float gain) {
     if (stem >= 0 && stem < kSongStems) songGain_[static_cast<size_t>(stem)].store(std::max(0.0f, gain));
@@ -273,6 +298,8 @@ void Engine::getPoolLoopStatus(int loop, RoundsLoopStatus* out) {
     out->layerOpen = s.layerOpen.load();
     out->peak = s.peak.exchange(0.0f);
     out->gain = loopGain_[static_cast<size_t>(loop)].load();
+    out->muted = loopMute_[static_cast<size_t>(loop)].load() ? 1 : 0;
+    out->pan = loopPan_[static_cast<size_t>(loop)].load();
     out->queued = s.queued.load();
     out->kind = s.kind.load();
     out->instrument = s.instrument.load();
@@ -464,8 +491,7 @@ void Engine::createPart() {
         cancelScheduled(to);
         dest.clear();
         players_[static_cast<size_t>(to)]->setInstrument(players_[static_cast<size_t>(from)]->instrument());
-        loopGain_[static_cast<size_t>(to)].store(loopGain_[static_cast<size_t>(from)].load(std::memory_order_relaxed),
-                                                std::memory_order_relaxed);
+        copyMix(from, to);
         shared_[static_cast<size_t>(to)] = false;
         const Looper& source = *loops_[static_cast<size_t>(from)];
         const Looper::State state = source.state();
@@ -491,6 +517,8 @@ void Engine::createEmptyPart(int part) {
         cancelScheduled(id);
         loops_[static_cast<size_t>(id)]->clear();
         loopGain_[static_cast<size_t>(id)].store(1.0f, std::memory_order_relaxed);
+        loopMute_[static_cast<size_t>(id)].store(false, std::memory_order_relaxed);
+        loopPan_[static_cast<size_t>(id)].store(0.0f, std::memory_order_relaxed);
         shared_[static_cast<size_t>(id)] = false;
     }
     emit(ROUNDS_EVENT_PART_CREATED, -1, part);
@@ -681,6 +709,8 @@ void Engine::apply(const Command& command) {
             cancelScheduled(id);
             loops_[static_cast<size_t>(id)]->clear();
             shared_[static_cast<size_t>(id)] = false;
+            loopMute_[static_cast<size_t>(id)].store(false, std::memory_order_relaxed);
+            loopPan_[static_cast<size_t>(id)].store(0.0f, std::memory_order_relaxed);
         }
         resetParts();
         resyncPublished();
@@ -716,6 +746,12 @@ void Engine::apply(const Command& command) {
             case ROUNDS_CMD_CLEAR:
                 cancelScheduled(loop);
                 looper.clear();
+                break;
+            case ROUNDS_CMD_HALVE:
+            case ROUNDS_CMD_DOUBLE:
+                // At least a bar (or the shortest loop before there is a tempo).
+                looper.resize(cmd == ROUNDS_CMD_DOUBLE, barLength_ > 0 ? barLength_ : 4800);
+                releaseStaleNotes();
                 break;
             case ROUNDS_CMD_UNDO_REVERTING_TAP:
                 // A queued tap never happened, so there is nothing to revert.
@@ -944,7 +980,8 @@ int Engine::songBarAt(int64_t index) const {
 }
 
 // Song sample i is heard at real time songOrigin_ + i, like a loop's index.
-void Engine::renderSong(float* out, int frames, int64_t start) {
+// Into the panned mix, like the loops.
+void Engine::renderSong(float* left, float* right, int frames, int64_t start) {
     if (!songPlaying_ || !song_ || song_->length <= 0) return;
     const Song& song = *song_;
     const int64_t latency = outputLatency_.load(std::memory_order_relaxed);
@@ -953,7 +990,12 @@ void Engine::renderSong(float* out, int frames, int64_t start) {
     for (int stem : laneStem_) {
         if (stem >= 0 && stem < song.count) gains[static_cast<size_t>(stem)] = songGain_[static_cast<size_t>(stem)].load(std::memory_order_relaxed);
     }
-    std::array<float, kSongStems> peaks{};
+    std::array<float, kSongStems> peaks{}, sideL{}, sideR{};
+    for (int s = 0; s < song.count; s++) {
+        const float pan = songPan_[static_cast<size_t>(s)].load(std::memory_order_relaxed);
+        sideL[static_cast<size_t>(s)] = std::min(1.0f, 1.0f - pan);
+        sideR[static_cast<size_t>(s)] = std::min(1.0f, 1.0f + pan);
+    }
     for (int i = 0; i < frames; i++) {
         const int64_t index = start + i + latency - songOrigin_;
         if (index >= song.length) {
@@ -963,13 +1005,12 @@ void Engine::renderSong(float* out, int frames, int64_t start) {
             break;
         }
         if (index < 0) continue;
-        float sum = 0.0f;
         for (int s = 0; s < song.count; s++) {
             const float v = song.stems[static_cast<size_t>(s)][static_cast<size_t>(index)] * gains[static_cast<size_t>(s)];
             peaks[static_cast<size_t>(s)] = std::max(peaks[static_cast<size_t>(s)], std::fabs(v));
-            sum += v;
+            left[i] += v * sideL[static_cast<size_t>(s)];
+            right[i] += v * sideR[static_cast<size_t>(s)];
         }
-        out[i] += sum;
     }
     for (int s = 0; s < song.count; s++) {
         std::atomic<float>& peak = stemPeak_[static_cast<size_t>(s)];
@@ -1156,7 +1197,8 @@ void Engine::renderClick(float* out, int frames, int64_t start) {
     }
 }
 
-void Engine::processChunk(const float* input, float* out, int frames, int64_t start) {
+// `out` is the centred mix; the loops go into loopsL_ / loopsR_ at `offset`.
+void Engine::processChunk(const float* input, float* out, int frames, int64_t start, int offset) {
     if (frames <= 0) return;
     if (probe_.active()) {
         // While calibrating the loopers hear silence and stay quiet.
@@ -1182,7 +1224,8 @@ void Engine::processChunk(const float* input, float* out, int frames, int64_t st
     for (int l = 0; l < kPool; l++) {
         Looper& looper = *loops_[static_cast<size_t>(l)];
         Player& player = *players_[static_cast<size_t>(l)];
-        const float gain = loopGain_[static_cast<size_t>(l)].load(std::memory_order_relaxed);
+        const float gain = loopMute_[static_cast<size_t>(l)].load(std::memory_order_relaxed)
+            ? 0.0f : loopGain_[static_cast<size_t>(l)].load(std::memory_order_relaxed);
         if (!heard_[static_cast<size_t>(l)]) {
             // Another part's loop keeps time; its notes ring out after a switch.
             looper.process(input, nullptr, frames, gain);
@@ -1193,16 +1236,23 @@ void Engine::processChunk(const float* input, float* out, int frames, int64_t st
         const int events = looper.collectNotes(frames, noteEvents_.data(), static_cast<int>(noteEvents_.size()));
         looper.process(input, scratch_.data(), frames, gain);
         player.render(scratch_.data(), frames, gain, noteEvents_.data(), events);
+        // Balance: centred, both sides at full level; panned, the other side fades.
+        const float pan = loopPan_[static_cast<size_t>(l)].load(std::memory_order_relaxed);
+        const float left = std::min(1.0f, 1.0f - pan), right = std::min(1.0f, 1.0f + pan);
+        float* L = loopsL_.data() + offset;
+        float* R = loopsR_.data() + offset;
         float peak = chunkPeak_[static_cast<size_t>(l)];
         for (int i = 0; i < frames; i++) {
-            out[i] += scratch_[static_cast<size_t>(i)];
-            peak = std::max(peak, std::fabs(scratch_[static_cast<size_t>(i)]));
+            const float v = scratch_[static_cast<size_t>(i)];
+            L[i] += v * left;
+            R[i] += v * right;
+            peak = std::max(peak, std::fabs(v));
         }
         chunkPeak_[static_cast<size_t>(l)] = peak;
     }
     players_[kKeysPlayer]->render(out, frames, 1.0f, nullptr, 0);
     players_[kPadsPlayer]->render(out, frames, 1.0f, nullptr, 0);
-    renderSong(out, frames, start);
+    renderSong(loopsL_.data() + offset, loopsR_.data() + offset, frames, start);
     renderClick(out, frames, start);
     const float monitor = monitorGain_.load(std::memory_order_relaxed);
     if (monitor > 0.0f) {
@@ -1254,6 +1304,8 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
     }
 
     std::memset(outL, 0, sizeof(float) * static_cast<size_t>(frames));
+    std::memset(loopsL_.data(), 0, sizeof(float) * static_cast<size_t>(frames));
+    std::memset(loopsR_.data(), 0, sizeof(float) * static_cast<size_t>(frames));
     chunkPeak_.fill(0.0f);
 
     // Render in chunks split exactly at command times and queued bar lines.
@@ -1285,17 +1337,20 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
         if (nextPart_ >= 0 && switchAt_ > at) chunk = std::min<int64_t>(chunk, switchAt_ - at);
         if (songStopAt_ > at) chunk = std::min<int64_t>(chunk, songStopAt_ - at);
         if (songJumpAt_ > at) chunk = std::min<int64_t>(chunk, songJumpAt_ - at);
-        processChunk(input + pos, outL + pos, static_cast<int>(chunk), at);
+        processChunk(input + pos, outL + pos, static_cast<int>(chunk), at, pos);
         pos += static_cast<int>(chunk);
     }
 
+    // The centred mix plus the panned loops.
     float inPeak = 0.0f;
     float outPeak = 0.0f;
     for (int i = 0; i < frames; i++) {
+        const float centre = outL[i];
+        outL[i] = centre + loopsL_[static_cast<size_t>(i)];
+        if (outR) outR[i] = centre + loopsR_[static_cast<size_t>(i)];
         inPeak = std::max(inPeak, std::fabs(input[i]));
-        outPeak = std::max(outPeak, std::fabs(outL[i]));
+        outPeak = std::max(outPeak, std::max(std::fabs(outL[i]), std::fabs(centre + loopsR_[static_cast<size_t>(i)])));
     }
-    if (outR) std::memcpy(outR, outL, sizeof(float) * static_cast<size_t>(frames));
 
     now_ += frames;
     stepTransfer();

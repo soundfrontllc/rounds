@@ -18,6 +18,7 @@ struct SongInfo: Equatable {
     var position: Double = 0   // 0...1
     var gains: [Float]
     var muted: [Bool]
+    var pans: [Float] = []
 }
 
 enum WholeSong {

@@ -56,6 +56,8 @@ public:
     void setLatency(int inputLatency, int outputLatency);
     void setMonitorGain(float gain) { monitorGain_.store(gain); }
     void setLoopGain(int loopID, float gain);
+    void setLoopMute(int loopID, bool muted);
+    void setLoopPan(int loopID, float pan);
     void setQuantize(bool on) { quantize_.store(on); }
     void setClickGain(float gain) { clickGain_.store(std::max(0.0f, gain)); }
     // Reinterprets the base loop as `bars` bars (1, 2, 4 or 8); the audio is untouched.
@@ -76,6 +78,7 @@ public:
     // Song (see rounds_engine_load_song). count 0 unloads.
     bool loadSong(const float* const* stems, int count, int64_t length, int64_t barLength, int64_t downbeat);
     void setSongGain(int stem, float gain);
+    void setSongPan(int stem, float pan);
     bool setSongBar(int bar);
     bool setSongLane(int slot, int stem);
     static constexpr int kSongStems = ROUNDS_MAX_SONG_STEMS;
@@ -198,7 +201,7 @@ private:
     void startSong(int64_t at);
     void stopSong();
     void emptyLanes();
-    void renderSong(float* out, int frames, int64_t start);
+    void renderSong(float* left, float* right, int frames, int64_t start);
     int songBarAt(int64_t index) const;
     int64_t nextBarLine(int64_t now) const;
     void freeRetiredSong();
@@ -218,7 +221,7 @@ private:
     void renderClick(float* out, int frames, int64_t start);
     void publish();
     void emit(RoundsEventType type, int loop, int64_t value);
-    void processChunk(const float* input, float* out, int frames, int64_t start);
+    void processChunk(const float* input, float* out, int frames, int64_t start, int offset);
     void stepTransfer();
     bool importing(int loop) const;
 
@@ -245,6 +248,7 @@ private:
     int64_t now_ = 0;
     std::vector<float> zeros_;
     std::vector<float> scratch_;          // one loop's output, for its peak
+    std::vector<float> loopsL_, loopsR_;  // the loops, panned (the rest of the mix is centred)
     std::array<float, kPool> chunkPeak_{};
     std::array<Published, kLoops> published_{};   // per slot of the playing part
     std::array<bool, kPool> heard_{};             // in the playing part (this chunk)
@@ -279,6 +283,7 @@ private:
     std::atomic<Song*> retiredSong_{nullptr};
     std::mutex songMutex_;      // loaders only (never the audio thread)
     std::array<std::atomic<float>, kSongStems> songGain_;
+    std::array<std::atomic<float>, kSongStems> songPan_;
     std::array<int, kLoops> laneStem_{};          // stem in each lane, -1 for none
     std::array<std::atomic<int>, kLoops> statLaneStem_;
     std::array<std::atomic<float>, kSongStems> stemPeak_;
@@ -295,6 +300,9 @@ private:
     std::atomic<int> outputLatency_{0};
     std::atomic<float> monitorGain_{0.0f};
     std::array<std::atomic<float>, kPool> loopGain_;
+    std::array<std::atomic<bool>, kPool> loopMute_;
+    std::array<std::atomic<float>, kPool> loopPan_;
+    void copyMix(int from, int to);
     std::atomic<bool> calibrateRequested_{false};
     std::atomic<bool> quantize_{false};
     std::atomic<float> clickGain_{0.0f};

@@ -36,6 +36,8 @@ enum Launchkey {
         static let off: UInt8 = 0
         static let white: UInt8 = 3
         static let dimWhite: UInt8 = 1
+        /// The dim shade of a palette colour (each colour has 4 shades, brightest first).
+        static func dim(_ color: UInt8) -> UInt8 { color == white ? dimWhite : color + 2 }
         static let red: UInt8 = 5
         static let orange: UInt8 = 9
         static let yellow: UInt8 = 13

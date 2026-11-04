@@ -90,8 +90,12 @@ extension LooperModel {
         songOverviews = overviews
         let names = Array(StemSeparator.names.prefix(stems.count))
         song = SongInfo(name: name, stems: names, bars: Int((length - prepared.downbeat) / prepared.barLength),
-                        gains: gains, muted: muted)
-        for i in names.indices { applySongGain(i) }
+                        gains: gains, muted: muted, pans: [Float](repeating: 0, count: names.count))
+        panKnobInControl = [Bool](repeating: false, count: panKnobInControl.count)
+        for i in names.indices {
+            applySongGain(i)
+            rounds_engine_set_song_pan(engine, Int32(i), 0)
+        }
         for (stem, lane) in lanes.enumerated() where stem < names.count && lane >= 0 && lane < loops.count {
             rounds_engine_set_song_lane(engine, Int32(lane), Int32(stem))
             knobsLetGo()
@@ -133,6 +137,12 @@ extension LooperModel {
         self.song?.muted[stem].toggle()
         applySongGain(stem)
         append("Song", "\(song.stems[stem]) \(song.muted[stem] ? "on" : "muted")")
+    }
+
+    func setSongPan(_ stem: Int, _ pan: Float) {
+        guard let engine, let song, stem < song.pans.count else { return }
+        self.song?.pans[stem] = max(-1, min(1, pan))
+        rounds_engine_set_song_pan(engine, Int32(stem), self.song?.pans[stem] ?? 0)
     }
 
     /// Where Play starts the song (or, while it plays, a jump at the next bar line).
