@@ -52,11 +52,21 @@ Engine::Engine(double sampleRate, double maxLoopSeconds, int maxBlockFrames)
     for (int i = 0; i < kPool + 2; i++) players_.push_back(std::make_unique<Player>(sampleRate, &kits_));
     resetParts();
     for (int i = 0; i < kParts * kLoops; i++) statPartLoops_[static_cast<size_t>(i)].store(i);
+    for (auto& gain : songGain_) gain.store(1.0f);
+    for (auto& peak : stemPeak_) peak.store(0.0f);
+    for (auto& stem : statLaneStem_) stem.store(-1);
+    laneStem_.fill(-1);
     players_[kPadsPlayer]->setInstrument(ROUNDS_INSTRUMENT_DRY_KIT);
     transferNotes_.resize(static_cast<size_t>(loops_[0]->maxNotes()));
     zeros_.assign(static_cast<size_t>(maxBlockFrames), 0.0f);
     scratch_.assign(static_cast<size_t>(maxBlockFrames), 0.0f);
     transferBuffer_.assign(static_cast<size_t>(loops_[0]->maxLoopSamples()), 0.0f);
+}
+
+Engine::~Engine() {
+    delete song_;
+    delete incomingSong_.load();
+    delete retiredSong_.load();
 }
 
 // ---------------------------------------------------------------------------
@@ -130,12 +140,56 @@ void Engine::setLoopGain(int loopID, float gain) {
     if (validID(loopID)) loopGain_[static_cast<size_t>(loopID)].store(std::max(0.0f, gain));
 }
 
+bool Engine::loadSong(const float* const* stems, int count, int64_t length, int64_t barLength, int64_t downbeat) {
+    if (count < 0 || count > kSongStems) return false;
+    if (count > 0 && (!stems || length <= 0 || barLength <= 0 || downbeat < 0 || downbeat >= length)) return false;
+    auto song = std::make_unique<Song>();
+    if (count > 0) {
+        song->count = count;
+        song->length = length;
+        song->barLength = barLength;
+        song->downbeat = downbeat;
+        for (int i = 0; i < count; i++) {
+            if (!stems[i]) return false;
+            song->stems[static_cast<size_t>(i)].assign(stems[i], stems[i] + length);
+        }
+    }
+    std::lock_guard<std::mutex> lock(songMutex_);
+    freeRetiredSong();
+    // A song the audio thread hasn't taken yet is simply replaced.
+    delete incomingSong_.exchange(song.release(), std::memory_order_acq_rel);
+    return true;
+}
+
+void Engine::freeRetiredSong() { delete retiredSong_.exchange(nullptr, std::memory_order_acq_rel); }
+
+void Engine::setSongGain(int stem, float gain) {
+    if (stem >= 0 && stem < kSongStems) songGain_[static_cast<size_t>(stem)].store(std::max(0.0f, gain));
+}
+
+bool Engine::setSongLane(int slot, int stem) {
+    if (!validLoop(slot) || stem < -1 || stem >= kSongStems) return false;
+    Command command{slot, kCmdSongLane, -1};
+    command.note = static_cast<int16_t>(stem);
+    return push(command);
+}
+
+bool Engine::setSongBar(int bar) {
+    if (bar < 1) return false;
+    return push(Command{bar, kCmdSongBar, -1});
+}
+
 bool Engine::switchPart(int part) {
     if (!validPart(part)) return false;
     return push(Command{part, kCmdSwitchPart, -1});
 }
 
 bool Engine::newPart() { return push(Command{-1, kCmdNewPart, -1}); }
+
+bool Engine::addEmptyPart(int part) {
+    if (!validPart(part)) return false;
+    return push(Command{part, kCmdEmptyPart, -1});
+}
 
 bool Engine::setShared(int loopID, bool shared) {
     if (!validID(loopID)) return false;
@@ -187,12 +241,24 @@ void Engine::getStatus(RoundsStatus* out) {
     out->part = statPart_.load();
     out->nextPart = statNextPart_.load();
     out->partSwitchIn = statSwitchIn_.load();
+    out->songLoaded = statSongLoaded_.load();
+    out->songPlaying = statSongPlaying_.load();
+    out->songLength = statSongLength_.load();
+    out->songPosition = statSongPosition_.load();
+    out->songBar = statSongBar_.load();
+    std::lock_guard<std::mutex> lock(songMutex_);
+    freeRetiredSong();
 }
 
 void Engine::getLoopStatus(int slot, RoundsLoopStatus* out) {
     *out = RoundsLoopStatus{};
     if (!validLoop(slot)) return;
     getPoolLoopStatus(partLoop(statPart_.load(std::memory_order_relaxed), slot), out);
+    const int stem = statLaneStem_[static_cast<size_t>(slot)].load(std::memory_order_relaxed);
+    if (stem >= 0) {
+        out->songStem = stem;
+        out->peak = stemPeak_[static_cast<size_t>(stem)].exchange(0.0f);
+    }
 }
 
 void Engine::getPoolLoopStatus(int loop, RoundsLoopStatus* out) {
@@ -213,6 +279,7 @@ void Engine::getPoolLoopStatus(int loop, RoundsLoopStatus* out) {
     out->notes = s.notes.load();
     out->loopID = loop;
     out->shared = s.shared.load();
+    out->songStem = -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -300,8 +367,9 @@ bool Engine::importing(int loop) const {
     return (state == kImportRequested || state == kImporting) && loop == transferLoop_;
 }
 
-// Anything recording or playing in the playing part.
+// Anything recording or playing in the playing part, or the song playing.
 bool Engine::running() const {
+    if (songPlaying_) return true;
     for (int slot = 0; slot < kLoops; slot++) {
         const Looper::State state = loops_[static_cast<size_t>(slotLoop(slot))]->state();
         if (state != Looper::State::Empty && state != Looper::State::Stopped) return true;
@@ -410,6 +478,22 @@ void Engine::createPart() {
     }
     emit(ROUNDS_EVENT_PART_CREATED, -1, part);
     requestSwitch(part);
+}
+
+void Engine::createEmptyPart(int part) {
+    if (partExists_[static_cast<size_t>(part)]) return;
+    auto& slots = partLoops_[static_cast<size_t>(part)];
+    slots.fill(-1);
+    partExists_[static_cast<size_t>(part)] = true;
+    for (int slot = 0; slot < kLoops; slot++) {
+        const int id = freeLoopFor(part, slot);
+        slots[static_cast<size_t>(slot)] = id;
+        cancelScheduled(id);
+        loops_[static_cast<size_t>(id)]->clear();
+        loopGain_[static_cast<size_t>(id)].store(1.0f, std::memory_order_relaxed);
+        shared_[static_cast<size_t>(id)] = false;
+    }
+    emit(ROUNDS_EVENT_PART_CREATED, -1, part);
 }
 
 // Copies a slice of the new part's loops after each block.
@@ -554,7 +638,9 @@ void Engine::apply(const Command& command) {
     // Slot commands act on the loop in that slot of the playing part.
     const int loop = validLoop(command.loop) ? slotLoop(command.loop) : -1;
     if (cmd == kCmdNote) {
-        applyNote(command, loop);
+        // Notes on a stem lane are played, not recorded.
+        const bool stemLane = validLoop(command.loop) && laneStem_[static_cast<size_t>(command.loop)] >= 0;
+        applyNote(command, stemLane ? -1 : loop);
     } else if (cmd == kCmdInstrument) {
         players_[static_cast<size_t>(loop)]->setInstrument(command.instrument);
     } else if (cmd == ROUNDS_CMD_START_STOP_ALL) {
@@ -563,6 +649,31 @@ void Engine::apply(const Command& command) {
         requestSwitch(command.loop);
     } else if (cmd == kCmdNewPart) {
         createPart();
+    } else if (cmd == kCmdEmptyPart) {
+        createEmptyPart(command.loop);
+    } else if (cmd == kCmdSongBar) {
+        if (song_ && song_->length > 0) {
+            const int last = std::max(1, songBarAt(song_->length - 1));
+            const int bar = std::min(command.loop, last);
+            if (songPlaying_) {
+                // Jump on the coming bar line, so the grid carries on.
+                const int64_t now = clock();
+                const int64_t since = wrap(now - gridOrigin_, barLength_);
+                songJumpAt_ = since == 0 ? now : now + barLength_ - since;
+                songJumpBar_ = bar;
+            } else {
+                songCue_ = bar;
+            }
+        }
+    } else if (cmd == kCmdSongLane) {
+        const bool usable = song_ && song_->length > 0 && command.note < song_->count;
+        if (command.note < 0 || usable) {
+            // A stem is in one lane at most.
+            for (int& stem : laneStem_) {
+                if (stem == command.note) stem = -1;
+            }
+            laneStem_[static_cast<size_t>(command.loop)] = command.note;
+        }
     } else if (cmd == kCmdShared) {
         shared_[static_cast<size_t>(command.loop)] = command.velocity != 0;
     } else if (cmd == kCmdReset) {
@@ -583,6 +694,9 @@ void Engine::apply(const Command& command) {
         }
         partLoops_[part][static_cast<size_t>(command.note)] = command.instrument;
         if (static_cast<int>(part) == part_) resyncPublished();
+    } else if (validLoop(command.loop) && laneStem_[static_cast<size_t>(command.loop)] >= 0) {
+        // A stem lane only plays the song; clearing it takes the stem out.
+        if (cmd == ROUNDS_CMD_CLEAR) laneStem_[static_cast<size_t>(command.loop)] = -1;
     } else {
         if (importing(loop)) return;  // the loop is being loaded from a session
         Looper& looper = *loops_[static_cast<size_t>(loop)];
@@ -732,7 +846,23 @@ void Engine::stop(int loop) {
 // Play button: stop everything (on the next bar), or start every stopped loop
 // together from the top of the longest one.
 void Engine::startStopAll() {
+    const bool song = song_ && song_->length > 0;
     if (running()) {
+        if (songPlaying_) {
+            if (!quantizing()) {
+                stopSong();
+            } else {
+                // On the bar line, like the loops (a press just after one counts for it).
+                const int64_t now = clock();
+                const int64_t since = wrap(now - gridOrigin_, barLength_);
+                const int64_t late = std::min<int64_t>(barLength_ / 8, static_cast<int64_t>(sampleRate_ / 4));
+                if (since <= late) {
+                    stopSong();
+                } else {
+                    songStopAt_ = now + barLength_ - since;
+                }
+            }
+        }
         for (int slot = 0; slot < kLoops; slot++) {
             const int i = slotLoop(slot);
             const Looper::State state = loops_[static_cast<size_t>(i)]->state();
@@ -754,11 +884,96 @@ void Engine::startStopAll() {
             longest = i;
         }
     }
-    if (longest < 0) return;
-    shiftAll(clock() - loops_[static_cast<size_t>(longest)]->origin());
-    for (int slot = 0; slot < kLoops; slot++) {
-        Looper& looper = *loops_[static_cast<size_t>(slotLoop(slot))];
-        if (looper.state() == Looper::State::Stopped) looper.tap();
+    // Everything starts from its top as heard: what is written now is heard
+    // outputLatency later, so start there and no first beat is cut short.
+    const int64_t top = clock() + outputLatency_.load(std::memory_order_relaxed);
+    if (longest >= 0) {
+        shiftAll(top - loops_[static_cast<size_t>(longest)]->origin());
+        for (int slot = 0; slot < kLoops; slot++) {
+            Looper& looper = *loops_[static_cast<size_t>(slotLoop(slot))];
+            if (looper.state() == Looper::State::Stopped) looper.tap();
+        }
+    }
+    if (song) {
+        // The song from its start bar, and the bar grid with it.
+        startSong(top);
+        gridOrigin_ = top;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Song
+
+// At the start of a block: picks up a song another thread loaded, handing the
+// old one back to be freed (once the last one has been).
+void Engine::takeSong() {
+    if (retiredSong_.load(std::memory_order_acquire) != nullptr) return;
+    Song* incoming = incomingSong_.exchange(nullptr, std::memory_order_acq_rel);
+    if (!incoming) return;
+    retiredSong_.store(song_, std::memory_order_release);
+    song_ = incoming;  // length 0: no song
+    songPlaying_ = false;
+    songCue_ = 1;
+    songStopAt_ = -1;
+    songJumpAt_ = -1;
+    emptyLanes();
+    updateBase();
+}
+
+void Engine::emptyLanes() { laneStem_.fill(-1); }
+
+void Engine::startSong(int64_t at) {
+    songOrigin_ = at - song_->barStart(songCue_);
+    songPlaying_ = true;
+    songStopAt_ = -1;
+    songJumpAt_ = -1;
+}
+
+// Stops, remembering the bar it was in so Play carries on from there.
+void Engine::stopSong() {
+    if (songPlaying_ && song_) songCue_ = songBarAt(clock() - songOrigin_);
+    songPlaying_ = false;
+    songStopAt_ = -1;
+    songJumpAt_ = -1;
+}
+
+int Engine::songBarAt(int64_t index) const {
+    if (!song_ || song_->barLength <= 0) return 1;
+    const int64_t bars = (index - song_->downbeat) / song_->barLength;
+    return static_cast<int>(std::max<int64_t>(0, bars)) + 1;
+}
+
+// Song sample i is heard at real time songOrigin_ + i, like a loop's index.
+void Engine::renderSong(float* out, int frames, int64_t start) {
+    if (!songPlaying_ || !song_ || song_->length <= 0) return;
+    const Song& song = *song_;
+    const int64_t latency = outputLatency_.load(std::memory_order_relaxed);
+    // Only stems in a lane are heard.
+    std::array<float, kSongStems> gains{};
+    for (int stem : laneStem_) {
+        if (stem >= 0 && stem < song.count) gains[static_cast<size_t>(stem)] = songGain_[static_cast<size_t>(stem)].load(std::memory_order_relaxed);
+    }
+    std::array<float, kSongStems> peaks{};
+    for (int i = 0; i < frames; i++) {
+        const int64_t index = start + i + latency - songOrigin_;
+        if (index >= song.length) {
+            // The end: back to the top for the next Play.
+            songPlaying_ = false;
+            songCue_ = 1;
+            break;
+        }
+        if (index < 0) continue;
+        float sum = 0.0f;
+        for (int s = 0; s < song.count; s++) {
+            const float v = song.stems[static_cast<size_t>(s)][static_cast<size_t>(index)] * gains[static_cast<size_t>(s)];
+            peaks[static_cast<size_t>(s)] = std::max(peaks[static_cast<size_t>(s)], std::fabs(v));
+            sum += v;
+        }
+        out[i] += sum;
+    }
+    for (int s = 0; s < song.count; s++) {
+        std::atomic<float>& peak = stemPeak_[static_cast<size_t>(s)];
+        if (peaks[static_cast<size_t>(s)] > peak.load(std::memory_order_relaxed)) peak.store(peaks[static_cast<size_t>(s)], std::memory_order_relaxed);
     }
 }
 
@@ -776,6 +991,17 @@ void Engine::fireScheduled(int loop) {
 
 // The first loop to get a length sets the tempo; it resets once every loop is empty.
 void Engine::updateBase() {
+    if (song_ && song_->length > 0) {
+        // The song's bars are the grid; loops snap to them.
+        if (barLength_ != song_->barLength) {
+            barLength_ = song_->barLength;
+            bars_ = 1;
+            baseLength_ = barLength_;
+            baseLoop_ = -1;
+            for (auto& looper : loops_) looper->setBarLength(barLength_);
+        }
+        return;
+    }
     bool anyLoop = false;
     for (int i = 0; i < kPool; i++) {
         const Looper& looper = *loops_[static_cast<size_t>(i)];
@@ -797,7 +1023,7 @@ void Engine::updateBase() {
 }
 
 void Engine::applyBars(int bars) {
-    if (baseLength_ <= 0 || bars < 1 || bars > 8 || (bars & (bars - 1)) != 0 || baseLength_ % bars != 0) return;
+    if ((song_ && song_->length > 0) || baseLength_ <= 0 || bars < 1 || bars > 8 || (bars & (bars - 1)) != 0 || baseLength_ % bars != 0) return;
     bars_ = bars;
     barLength_ = baseLength_ / bars;
     for (auto& looper : loops_) looper->setBarLength(barLength_);
@@ -976,6 +1202,7 @@ void Engine::processChunk(const float* input, float* out, int frames, int64_t st
     }
     players_[kKeysPlayer]->render(out, frames, 1.0f, nullptr, 0);
     players_[kPadsPlayer]->render(out, frames, 1.0f, nullptr, 0);
+    renderSong(out, frames, start);
     renderClick(out, frames, start);
     const float monitor = monitorGain_.load(std::memory_order_relaxed);
     if (monitor > 0.0f) {
@@ -1011,6 +1238,7 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
     }
     const int bars = requestedBars_.exchange(0, std::memory_order_relaxed);
     if (bars > 0) applyBars(bars);
+    takeSong();
 
     // Move queued commands into the time-ordered pending list.
     Command incoming;
@@ -1044,12 +1272,19 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
             }
         }
         if (nextPart_ >= 0 && switchAt_ <= at) fireSwitch();
+        if (songStopAt_ >= 0 && songStopAt_ <= at) stopSong();
+        if (songJumpAt_ >= 0 && songJumpAt_ <= at) {
+            songOrigin_ = songJumpAt_ - song_->barStart(songJumpBar_);
+            songJumpAt_ = -1;
+        }
         int64_t chunk = frames - pos;
         if (pendingCount_ > 0) chunk = std::min<int64_t>(chunk, pending_[0].time - at);
         for (const Scheduled& s : scheduled_) {
             if (s.action != kNone) chunk = std::min<int64_t>(chunk, s.time - at);
         }
         if (nextPart_ >= 0 && switchAt_ > at) chunk = std::min<int64_t>(chunk, switchAt_ - at);
+        if (songStopAt_ > at) chunk = std::min<int64_t>(chunk, songStopAt_ - at);
+        if (songJumpAt_ > at) chunk = std::min<int64_t>(chunk, songJumpAt_ - at);
         processChunk(input + pos, outL + pos, static_cast<int>(chunk), at);
         pos += static_cast<int>(chunk);
     }
@@ -1101,6 +1336,18 @@ void Engine::process(const float* input, float* outL, float* outR, int frames) {
         ps.exists.store(partExists_[static_cast<size_t>(p)] ? 1 : 0, std::memory_order_relaxed);
         ps.loops.store(loops, std::memory_order_relaxed);
         ps.cycle.store(partCycle, std::memory_order_relaxed);
+    }
+    const bool hasSong = song_ && song_->length > 0;
+    statSongLoaded_.store(hasSong ? 1 : 0, std::memory_order_relaxed);
+    statSongPlaying_.store(songPlaying_ ? 1 : 0, std::memory_order_relaxed);
+    statSongLength_.store(hasSong ? song_->length : 0, std::memory_order_relaxed);
+    if (hasSong) {
+        const int64_t heard = std::clamp<int64_t>(now_ + out - songOrigin_, 0, song_->length);
+        statSongPosition_.store(songPlaying_ ? heard : song_->barStart(songCue_), std::memory_order_relaxed);
+        statSongBar_.store(songPlaying_ ? songBarAt(heard) : songCue_, std::memory_order_relaxed);
+    }
+    for (int slot = 0; slot < kLoops; slot++) {
+        statLaneStem_[static_cast<size_t>(slot)].store(laneStem_[static_cast<size_t>(slot)], std::memory_order_relaxed);
     }
     statPart_.store(part_, std::memory_order_relaxed);
     statNextPart_.store(nextPart_, std::memory_order_relaxed);

@@ -47,6 +47,7 @@ struct LoopInfo: Identifiable, Equatable {
     var notes = 0
     var loopID = 0                   // the engine loop in this slot of the playing part
     var shared = false               // "New part" keeps it instead of copying it
+    var stem = -1                    // the song stem in this lane (it only plays the song), or -1
 
     var isDrumLoop: Bool { state != .empty && midi && instrument.isKit }
 
@@ -123,6 +124,18 @@ final class LooperModel: ObservableObject {
     static let defaultPartNames = ["Verse", "Chorus", "Bridge", "Part 4", "Part 5", "Part 6", "Part 7", "Part 8"]
     /// The Launchkey's Shift is held: the top pads switch parts.
     @Published private(set) var shiftDown = false
+    /// A part asked for empty (imported stems), so its event isn't described as a copy.
+    var emptyPartRequested: Int?
+    /// The whole song playing along (imported stems), if one is loaded.
+    @Published var song: SongInfo?
+    /// What the loaded song was made from, kept for saving the session.
+    var songSource: (stems: [[Float]], grid: SongGrid)?
+    /// The song's bars at the engine's rate (for the position strip).
+    var songBarLength: Int64 = 0
+    var songDownbeat: Int64 = 0
+    /// Each stem's peaks across the song, for its lane.
+    var songOverviews: [[Float]] = []
+    var stemKnobInControl = [Bool](repeating: false, count: Int(ROUNDS_MAX_SONG_STEMS))
     /// The first loop recorded sets the tempo.
     @Published var baseSeconds: Double = 0
     @Published var baseLoop = -1
@@ -143,7 +156,7 @@ final class LooperModel: ObservableObject {
             applyTransportSettings()
         }
     }
-    private var barLength: Int64 = 0
+    private(set) var barLength: Int64 = 0
     /// Kept here so volumes survive restarting the audio device.
     private var gains = [Float](repeating: 1, count: Int(ROUNDS_MAX_LOOPS))
     /// The Launchkey can't report where its knobs are, so the last value each
@@ -165,6 +178,7 @@ final class LooperModel: ObservableObject {
     @Published var showLog = true
 
     let router = ControlRouter()
+    let stemImport = StemImport()
     private lazy var midi = MIDIInput(router: router)
     private var audio: OpaquePointer?
     private(set) var engine: OpaquePointer?
@@ -186,6 +200,7 @@ final class LooperModel: ObservableObject {
             MainActor.assumeIsolated { self?.devicesChanged() }
         }
         router.onGesture = { [weak self] gesture in self?.logGesture(gesture) }
+        stemImport.onLog = { [weak self] line in self?.append("Stems", line) }
         router.onPedal = { [weak self] down in self?.pedalDown = down }
         midi.onLog = { [weak self] line in self?.append("MIDI", line) }
         midi.onLaunchkey = { [weak self] control in self?.launchkey(control) }
@@ -438,7 +453,8 @@ final class LooperModel: ObservableObject {
     private func updateNoteRoutes() {
         let selected = loops[selectedLoop]
         // A loop recording audio still becomes MIDI if keys (or pads) come in.
-        let open = selected.state == .empty || (selected.state == .recording && !selected.midi)
+        // A song stem's lane only plays the song.
+        let open = selected.stem < 0 && (selected.state == .empty || (selected.state == .recording && !selected.midi))
         let keysOnLoop = open || selected.midi
         let keys = ControlRouter.NoteRoute(loop: keysOnLoop ? Int32(selectedLoop) : -1, instrument: keysInstrument.rawValue)
         // A selected open loop takes the pads even when a drum loop exists, so
@@ -532,15 +548,36 @@ final class LooperModel: ObservableObject {
         let previous = knobValues[knob]
         knobValues[knob] = value
         UserDefaults.standard.set(knobValues, forKey: "knobValues")
-        if !knobInControl[knob] {
-            // Take over once the knob reaches or crosses the current volume.
-            let target = Int((sqrt(loops[knob].gain) * 127).rounded())
-            let crossed = previous >= 0 && (previous - target) * (value - target) <= 0
-            guard crossed || abs(value - target) <= 2 else { return }
-            knobInControl[knob] = true
-            append("Launchkey", "Knob \(knob + 1) picked up loop \(knob + 1)'s volume")
+        if loops[knob].stem >= 0 {
+            stemKnobMoved(knob, stem: loops[knob].stem, from: previous, to: value)
+            return
         }
-        applyGain(knob, Self.knobGain(value))
+        switch Self.takeover(gain: loops[knob].gain, inControl: knobInControl[knob], from: previous, to: value) {
+        case nil: return
+        case let .some((gain, caughtUp)):
+            if caughtUp && !knobInControl[knob] {
+                knobInControl[knob] = true
+                append("Launchkey", "Knob \(knob + 1) caught up with loop \(knob + 1)'s volume")
+            }
+            applyGain(knob, gain)
+        }
+    }
+
+    /// A knob whose position doesn't match the volume (changed in the window,
+    /// a part switch, a new stem) moves it at once, scaled so the two meet at
+    /// the end of the knob's travel, and from then on follows it exactly.
+    /// Returns the new gain and whether the knob now matches; nil to ignore.
+    static func takeover(gain: Float, inControl: Bool, from previous: Int, to value: Int) -> (Float, Bool)? {
+        if inControl { return (knobGain(value), true) }
+        let target = Double(sqrt(gain)) * 127   // the volume as a knob position
+        let crossed = previous >= 0 && (Double(previous) - target) * (Double(value) - target) <= 0
+        if crossed || abs(Double(value) - target) <= 2 { return (knobGain(value), true) }
+        guard previous >= 0, value != previous else { return nil }
+        let p = Double(previous), v = Double(value)
+        let moved = v > p ? target + (v - p) * (127 - target) / max(1, 127 - p)
+                          : target - (p - v) * target / max(1, p)
+        let fraction = Float(min(127, max(0, moved)) / 127)
+        return (fraction * fraction, false)
     }
 
     private var lastLEDState: [String]?
@@ -576,7 +613,7 @@ final class LooperModel: ObservableObject {
     private func updateLaunchkeyLEDs(force: Bool = false) {
         let key = shiftDown
             ? ["parts \(currentPart) \(nextPart)"] + parts.map { "\($0.exists)" }
-            : loops.map { "\($0.state)/\($0.queued)" }
+            : loops.map { "\($0.state)/\($0.queued)/\(stemLight($0))" }
         guard force || key != lastLEDState || selectedLoop != lastLEDSelected else { return }
         lastLEDState = key
         lastLEDSelected = selectedLoop
@@ -602,6 +639,15 @@ final class LooperModel: ObservableObject {
             let pad = loop.id
             let loopState = loop.state
             let color = Self.slotColors[pad]
+            if loop.stem >= 0 {
+                // A song stem: its colour while the song plays, dim while
+                // stopped or muted.
+                messages.append(Launchkey.loopPadLED(pad, color: stemLight(loop) == 1 ? color : Launchkey.Color.dimWhite))
+                if pad == selectedLoop {
+                    messages.append(Launchkey.loopPadLED(pad, color: Launchkey.Color.white, mode: .flashing))
+                }
+                continue
+            }
             // Blinking = waiting for the next bar.
             switch (loop.queued, loopState) {
             case (.tap, .empty):
@@ -639,6 +685,13 @@ final class LooperModel: ObservableObject {
         midi.sendToLaunchkey(messages)
     }
 
+    /// 1: a stem lane heard now; 0: a stem lane stopped or muted; -1: not a stem lane.
+    private func stemLight(_ loop: LoopInfo) -> Int {
+        guard loop.stem >= 0 else { return -1 }
+        guard let song, loop.stem < song.muted.count else { return 0 }
+        return song.playing && !song.muted[loop.stem] && song.gains[loop.stem] > 0 ? 1 : 0
+    }
+
     // MARK: Polling
 
     private func poll() {
@@ -653,8 +706,9 @@ final class LooperModel: ObservableObject {
         baseSeconds = Double(s.baseLength) / s.sampleRate
         baseLoop = Int(s.baseLoop)
         if Int(s.bars) != bars, s.bars > 0 {
-            append("Tempo", String(format: "%.1f BPM: loop %d is %d bar%@", 240 * s.sampleRate / Double(s.barLength),
-                                   s.baseLoop + 1, s.bars, s.bars == 1 ? "" : "s"))
+            let base = s.baseLoop >= 0 ? "loop \(s.baseLoop + 1)" : "the first loop"
+            append("Tempo", String(format: "%.1f BPM: %@ is %d bar%@", 240 * s.sampleRate / Double(s.barLength),
+                                   base, s.bars, s.bars == 1 ? "" : "s"))
         }
         bars = Int(s.bars)
         barLength = s.barLength
@@ -695,6 +749,11 @@ final class LooperModel: ObservableObject {
             updated[i].notes = Int(l.notes)
             updated[i].loopID = Int(l.loopID)
             updated[i].shared = l.shared != 0
+            updated[i].stem = Int(l.songStem)
+            if loops[i].stem >= 0, updated[i].stem < 0, let song, s.songLoaded != 0, !sessionBusy, loops[i].stem < song.stems.count {
+                append("Loop \(i + 1)", "The song's \(song.stems[loops[i].stem]) stem is out (cleared); the lane is free for a loop")
+                knobsLetGo()
+            }
             gains[i] = l.gain
             let sameLoop = loops[i].loopID == updated[i].loopID
             if sameLoop && updated[i].midi && loopState != .empty && !(loops[i].midi && loops[i].state != .empty) {
@@ -714,6 +773,7 @@ final class LooperModel: ObservableObject {
         layers = selected.layers
         inputLevel = max(s.inputPeak, inputLevel * 0.8)
         outputLevel = max(s.outputPeak, outputLevel * 0.8)
+        pollSong(s)
         latencyIn = Int(s.inputLatency)
         latencyOut = Int(s.outputLatency)
         calibrating = s.calibrating != 0
@@ -757,9 +817,15 @@ final class LooperModel: ObservableObject {
             append("Part", event.value >= 0 ? "\(partTitle(Int(event.value))) starts at the end of the cycle"
                                             : "Part switch taken back")
         case ROUNDS_EVENT_PART_CREATED.rawValue:
-            append("Part", event.value >= 0
-                   ? "\(partTitle(Int(event.value))) made from \(partTitle(currentPart)): shared loops kept, others copied"
-                   : "All 8 parts are used")
+            let part = Int(event.value)
+            if part < 0 {
+                append("Part", "All 8 parts are used")
+            } else if part == emptyPartRequested {
+                emptyPartRequested = nil
+                append("Part", "\(partTitle(part)) made (empty)")
+            } else {
+                append("Part", "\(partTitle(part)) made from \(partTitle(currentPart)): shared loops kept, others copied")
+            }
         case ROUNDS_EVENT_QUEUE_FULL.rawValue:
             append("Loop", "Command dropped (queue full)")
         default:
@@ -786,6 +852,10 @@ final class LooperModel: ObservableObject {
         default: return
         }
         append("Footswitch", name)
+        let lane = loops[selectedLoop]
+        if lane.stem >= 0, let song, lane.stem < song.stems.count, gesture != ROUNDS_GESTURE_LONG_HOLD {
+            append("Loop \(selectedLoop + 1)", "Plays the song's \(song.stems[lane.stem]) stem; only Clear (hold 2 s) acts on it")
+        }
     }
 
     func append(_ source: String, _ text: String) {

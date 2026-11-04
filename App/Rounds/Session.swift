@@ -29,6 +29,19 @@ struct SessionManifest: Codable {
     var loops: [Loop]
     var parts: [Part]?         // nil: one part, its slots playing loops 1-8
     var part: Int?             // the part that was playing
+    var song: Song?            // the whole song playing along, if any
+
+    /// Saved as the split stems (44.1 kHz mono, lossless ALAC) and their grid,
+    /// fitted to the session again on load.
+    struct Song: Codable {
+        var name: String
+        var files: [String]    // one per stem, in StemSeparator.names order
+        var bpm: Double
+        var downbeat: Double   // seconds
+        var gains: [Float]
+        var muted: [Bool]
+        var lanes: [Int]?      // the lane each stem plays in (-1 none); nil: stem i in lane i
+    }
 
     struct Part: Codable {
         var index: Int
@@ -55,7 +68,7 @@ enum SessionFiles {
 
     /// Writes the session into a scratch folder, then swaps it in, so a failed
     /// save never leaves half a session behind.
-    static func write(_ manifest: SessionManifest, audio: [Int: [Float]], to folder: URL) throws {
+    static func write(_ manifest: SessionManifest, audio: [Int: [Float]], song: [[Float]] = [], to folder: URL) throws {
         let fm = FileManager.default
         if fm.fileExists(atPath: folder.path) && !isSession(folder) {
             throw SessionError.message("\(folder.lastPathComponent) already exists and isn't a Rounds session, so it wasn't replaced.")
@@ -69,6 +82,9 @@ enum SessionFiles {
         for loop in manifest.loops {
             guard let file = loop.file, let samples = audio[loop.slot] else { continue }
             try writeWAV(samples, sampleRate: manifest.sampleRate, to: staged.appendingPathComponent(file))
+        }
+        for (file, samples) in zip(manifest.song?.files ?? [], song) {
+            try writeLossless(samples, sampleRate: StemSeparator.sampleRate, to: staged.appendingPathComponent(file))
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -105,6 +121,21 @@ enum SessionFiles {
         guard let buffer = buffer(samples, sampleRate: sampleRate) else { throw SessionError.message("Out of memory") }
         // AVAudioFile writes its last chunk when it is released; the pool makes
         // that happen before this returns, not whenever the thread drains.
+        try autoreleasepool {
+            let file = try AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+            try file.write(from: buffer)
+        }
+    }
+
+    /// Apple Lossless, 24-bit, in a CAF: a song's stems at about half the size of WAV.
+    static func writeLossless(_ samples: [Float], sampleRate: Double, to url: URL) throws {
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatAppleLossless,
+            AVSampleRateKey: sampleRate,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderBitDepthHintKey: 24,
+        ]
+        guard let buffer = buffer(samples, sampleRate: sampleRate) else { throw SessionError.message("Out of memory") }
         try autoreleasepool {
             let file = try AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
             try file.write(from: buffer)
@@ -211,6 +242,7 @@ extension LooperModel {
     func newSession() {
         guard let engine, !sessionBusy else { return }
         rounds_engine_reset(engine)
+        unloadSong()
         partNames = Self.defaultPartNames
         sessionURL = nil
         append("Session", "New session")
@@ -286,10 +318,18 @@ extension LooperModel {
             manifest.bars = nil
         }
 
+        var songStems: [[Float]] = []
+        if let song, let source = songSource {
+            manifest.song = SessionManifest.Song(name: song.name, files: song.stems.map { "song-\($0.lowercased()).caf" },
+                                                 bpm: source.grid.bpm, downbeat: source.grid.downbeat,
+                                                 gains: song.gains, muted: song.muted, lanes: songLanes)
+            songStems = source.stems
+        }
         let toWrite = manifest
         let snapshot = audio
+        let songSnapshot = songStems
         do {
-            try await Task.detached { try SessionFiles.write(toWrite, audio: snapshot, to: url) }.value
+            try await Task.detached { try SessionFiles.write(toWrite, audio: snapshot, song: songSnapshot, to: url) }.value
         } catch {
             return sessionFailed("Couldn't save \(name): \(error.localizedDescription)")
         }
@@ -330,6 +370,24 @@ extension LooperModel {
                 rounds_engine_set_part_loop(engine, Int32(part.index), Int32(slot), Int32(id))
             }
             partNames[part.index] = part.name
+        }
+        // The song first: it sets the tempo the loops were made at.
+        unloadSong()
+        if let entry = manifest.song {
+            do {
+                let stems = try await Task.detached {
+                    try entry.files.map { file -> [Float] in
+                        let (samples, rate) = try SessionFiles.readAudio(url.appendingPathComponent(file))
+                        return try SessionFiles.resample(samples, from: rate, to: StemSeparator.sampleRate)
+                    }
+                }.value
+                let grid = SongGrid(bpm: entry.bpm, downbeat: entry.downbeat)
+                // Loaded before any loop, so it sets the tempo again.
+                await loadSong(name: entry.name, stems: stems, grid: grid, gains: entry.gains, muted: entry.muted,
+                               lanes: entry.lanes ?? Array(stems.indices), fitTo: nil)
+            } catch {
+                append("Session", "The song couldn't be loaded: \(error.localizedDescription)")
+            }
         }
         let slots = Set(audio.keys).union(midi.keys)
         let order = slots.sorted { a, b in a == manifest.baseLoop || (b != manifest.baseLoop && a < b) }
@@ -457,7 +515,7 @@ extension LooperModel {
     }
 
     /// The audio thread copies a slice per block; wait for it here.
-    private func finishTransfer(_ engine: OpaquePointer) async -> Int32 {
+    func finishTransfer(_ engine: OpaquePointer) async -> Int32 {
         for _ in 0..<2000 {
             guard self.engine == engine else { return -1 }
             let status = rounds_engine_transfer_status(engine)
@@ -467,7 +525,7 @@ extension LooperModel {
         return -1
     }
 
-    private func sessionFailed(_ text: String) {
+    func sessionFailed(_ text: String) {
         sessionMessage = text
         append("Session", text)
     }
