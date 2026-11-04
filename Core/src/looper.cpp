@@ -167,10 +167,12 @@ void Looper::clear() {
     baseWriting_ = false;
     baseWritten_ = 0;
     loopLength_ = 0;
+    basePeriod_ = 0;
     for (int slot : order_) layer(slot).inUse = false;
     order_.clear();
     openLayer_ = -1;
     flattenSlot_ = -1;
+    flattenExtend_ = -1;
     kind_ = Kind::Audio;
     noteCount_ = 0;
 }
@@ -201,6 +203,7 @@ bool Looper::finishRecording() {
         std::max<int64_t>(config_.minLoopSamples, inputLatency_ + outputLatency_ + 2 * config_.crossfadeSamples);
     if (length < minimum) return false;
     loopLength_ = snapLength(std::min(length, config_.maxLoopSamples), minimum);
+    basePeriod_ = loopLength_;
     if (kind_ == Kind::Midi) {
         // Notes past the snapped end were the next time round: drop them.
         int kept = 0;
@@ -259,6 +262,7 @@ int Looper::openLayer() {
     l.startS = clock_;
     l.closeS = INT64_MAX;
     l.openIndex = wrap(clock_ - origin_, loopLength_);
+    l.period = loopLength_;
     l.written = 0;
     l.writing = true;
     order_.push_back(slot);
@@ -313,6 +317,39 @@ void Looper::mergeOldestLayer() {
 }
 
 // ---------------------------------------------------------------------------
+// ½ / ×2
+
+bool Looper::resize(bool doubled, int64_t minimum) {
+    if (state_ != State::Playing && state_ != State::Stopped) return false;
+    // An audio loop still writing its last samples (just closed) can't change yet.
+    if ((kind_ == Kind::Audio && baseWriting_) || openLayer_ >= 0 || loopLength_ <= 0) return false;
+    const int64_t length = doubled ? loopLength_ * 2 : loopLength_ / 2;
+    if (doubled ? length > config_.maxLoopSamples : (loopLength_ % 2 != 0 || length < std::max<int64_t>(1, minimum))) return false;
+    if (kind_ == Kind::Midi) {
+        if (doubled) {
+            if (noteCount_ * 2 > config_.maxNotes) return false;
+            for (int i = 0, count = noteCount_; i < count; i++) {
+                Note n = notes_[static_cast<size_t>(i)];
+                n.index += loopLength_;
+                notes_[static_cast<size_t>(noteCount_++)] = n;
+            }
+        } else {
+            int kept = 0;
+            for (int i = 0; i < noteCount_; i++) {
+                Note n = notes_[static_cast<size_t>(i)];
+                if (n.index >= length) continue;
+                if (n.length >= 0) n.length = std::min(n.length, length - 1);
+                notes_[static_cast<size_t>(kept++)] = n;
+            }
+            noteCount_ = kept;
+        }
+    }
+    loopLength_ = length;
+    lastTap_ = TapEffect::None;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Copying (a new part)
 
 void Looper::copySlice(const Looper& source, int64_t offset, int64_t count) {
@@ -326,6 +363,7 @@ void Looper::copySlice(const Looper& source, int64_t offset, int64_t count) {
 void Looper::finishCopy(const Looper& source) {
     clear();  // keeps base_
     loopLength_ = std::min(source.loopLength_, config_.maxLoopSamples);
+    basePeriod_ = loopLength_;
     origin_ = source.origin_;
     barLength_ = source.barLength_;
     kind_ = source.kind_;
@@ -352,6 +390,7 @@ void Looper::loadSlice(const float* samples, int64_t offset, int64_t count) {
 void Looper::finishLoad(int64_t length, int64_t origin) {
     clear();  // keeps base_, drops any layers
     loopLength_ = std::min(length, config_.maxLoopSamples);
+    basePeriod_ = loopLength_;
     origin_ = origin;
     state_ = State::Stopped;
 }
@@ -507,8 +546,8 @@ void Looper::writeInput(float sample, int64_t s) {
             }
             gain = std::min(gain, 1.0f - static_cast<float>(into) / static_cast<float>(fade));
         }
-        const size_t index = static_cast<size_t>(wrap(layer.openIndex + layer.written, loopLength_));
-        if (layer.written < loopLength_) {
+        const size_t index = static_cast<size_t>(wrap(layer.openIndex + layer.written, layer.period));
+        if (layer.written < layer.period) {
             layer.buffer[index] = sample * gain;
         } else {
             layer.buffer[index] += sample * gain;
@@ -517,40 +556,76 @@ void Looper::writeInput(float sample, int64_t s) {
     }
 }
 
+// `index` is within the layer's period.
 bool Looper::layerCovers(const Layer& layer, int64_t index) const {
-    const int64_t covered = std::min(layer.written, loopLength_);
-    return wrap(index - layer.openIndex, loopLength_) < covered;
+    const int64_t covered = std::min(layer.written, layer.period);
+    return wrap(index - layer.openIndex, layer.period) < covered;
 }
 
+// What the loop plays at `index`. A loop cut shorter (½) than what it holds
+// crossfades its new seam with the audio that followed it.
 float Looper::readLoop(int64_t index) const {
+    const int fade = config_.crossfadeSamples;
+    if (index < fade && loopLength_ > 0 && !baseWriting_) {
+        bool cut = basePeriod_ > loopLength_;
+        for (int slot : order_) cut = cut || layer(slot).period > loopLength_;
+        if (cut) {
+            const float g = static_cast<float>(index) / static_cast<float>(fade);
+            return readRaw(index) * g + readRaw(index + loopLength_) * (1.0f - g);
+        }
+    }
+    return readRaw(index);
+}
+
+// Base and layers each repeat at their own period.
+float Looper::readRaw(int64_t index) const {
     // Not recorded yet (a loop that snapped longer than was played): silence,
     // not whatever an earlier take left in the buffer.
-    float sum = baseWriting_ && index >= baseWritten_ ? 0.0f : base_[static_cast<size_t>(index)];
+    const int64_t b = basePeriod_ > 0 ? index % basePeriod_ : index;
+    float sum = baseWriting_ && b >= baseWritten_ ? 0.0f : base_[static_cast<size_t>(b)];
     for (size_t i = 0; i < order_.size(); i++) {
         const int slot = order_[i];
-        if (slot == flattenSlot_ && index < flattenPos_) continue;  // already merged into base
+        // Already merged into the base.
+        if (slot == flattenSlot_ && flattenExtend_ < 0 && b < flattenPos_) continue;
         const Layer& layer = this->layer(slot);
-        if (layerCovers(layer, index)) sum += layer.buffer[static_cast<size_t>(index)];
+        if (layer.period <= 0) continue;
+        const int64_t k = index % layer.period;
+        if (layerCovers(layer, k)) sum += layer.buffer[static_cast<size_t>(k)];
     }
     return sum;
 }
 
+// Merges the oldest layer into the base, a slice per block. A layer longer
+// than the base (recorded after ×2) first has the base repeated out to its
+// length; a shorter one (after ½) is added at every repeat.
 void Looper::stepFlatten() {
     if (flattenSlot_ < 0) return;
     Layer& layer = this->layer(flattenSlot_);
+    const int64_t period = std::max(basePeriod_, layer.period);
     if (kind_ == Kind::Midi) {
         // Notes merge at once: they just join the base.
         for (int i = 0; i < noteCount_; i++) {
             if (notes_[static_cast<size_t>(i)].layer == flattenSlot_) notes_[static_cast<size_t>(i)].layer = -1;
         }
-        flattenPos_ = loopLength_;
+        flattenExtend_ = -1;
+        flattenPos_ = period;
+    } else if (flattenPos_ == 0 && basePeriod_ < period) {
+        if (flattenExtend_ < 0) flattenExtend_ = basePeriod_;
+        const int64_t end = std::min(period, flattenExtend_ + config_.flattenSamplesPerBlock);
+        for (int64_t k = flattenExtend_; k < end; k++) base_[static_cast<size_t>(k)] = base_[static_cast<size_t>(k % basePeriod_)];
+        flattenExtend_ = end;
+        if (end < period) return;
+        basePeriod_ = period;
+        flattenExtend_ = -1;
+        return;
     }
-    const int64_t end = std::min(loopLength_, flattenPos_ + config_.flattenSamplesPerBlock);
+    const int64_t end = std::min(period, flattenPos_ + config_.flattenSamplesPerBlock);
     for (int64_t k = flattenPos_; k < end; k++) {
-        if (layerCovers(layer, k)) base_[static_cast<size_t>(k)] += layer.buffer[static_cast<size_t>(k)];
+        const int64_t j = k % layer.period;
+        if (layerCovers(layer, j)) base_[static_cast<size_t>(k)] += layer.buffer[static_cast<size_t>(j)];
     }
     flattenPos_ = end;
-    if (flattenPos_ >= loopLength_) {
+    if (flattenPos_ >= period) {
         const int slot = flattenSlot_;
         flattenSlot_ = -1;
         layer.inUse = false;

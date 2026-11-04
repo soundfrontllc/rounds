@@ -48,6 +48,8 @@ struct LoopInfo: Identifiable, Equatable {
     var loopID = 0                   // the engine loop in this slot of the playing part
     var shared = false               // "New part" keeps it instead of copying it
     var stem = -1                    // the song stem in this lane (it only plays the song), or -1
+    var muted = false
+    var pan: Float = 0               // -1 left ... 1 right
 
     var isDrumLoop: Bool { state != .empty && midi && instrument.isKit }
 
@@ -167,6 +169,8 @@ final class LooperModel: ObservableObject {
     /// or the knob moved while Rounds was closed): the knob then picks the
     /// volume up only once it passes it, instead of jumping.
     private var knobInControl = [Bool](repeating: true, count: Int(ROUNDS_MAX_LOOPS))
+    /// The same for Shift + knob (pan), per lane.
+    var panKnobInControl = [Bool](repeating: false, count: Int(ROUNDS_MAX_LOOPS))
 
     /// Folder of the session last saved or opened (nil = never saved).
     @Published var sessionURL: URL?
@@ -394,6 +398,61 @@ final class LooperModel: ObservableObject {
     /// After a part switch or a session load the knobs no longer match the loops.
     func knobsLetGo() {
         knobInControl = [Bool](repeating: false, count: knobInControl.count)
+        panKnobInControl = [Bool](repeating: false, count: panKnobInControl.count)
+    }
+
+    // MARK: Mute, pan, ½ / ×2
+
+    /// Mute goes with the loop, like its volume.
+    func toggleMute(_ slot: Int) {
+        let loop = loops[slot]
+        if loop.stem >= 0 { return toggleSongMute(loop.stem) }
+        guard let engine, loop.state != .empty else { return }
+        rounds_engine_set_loop_mute(engine, Int32(loop.loopID), loop.muted ? 0 : 1)
+        loops[slot].muted.toggle()
+        append("Loop \(slot + 1)", loop.muted ? "Unmuted" : "Muted")
+    }
+
+    /// From the window: Shift + knob no longer matches.
+    func setPan(_ slot: Int, _ pan: Float) {
+        panKnobInControl[slot] = false
+        applyPan(slot, pan)
+    }
+
+    private func applyPan(_ slot: Int, _ pan: Float) {
+        let loop = loops[slot]
+        if loop.stem >= 0 { return setSongPan(loop.stem, pan) }
+        guard let engine else { return }
+        let clamped = max(-1, min(1, pan))
+        rounds_engine_set_loop_pan(engine, Int32(loop.loopID), clamped)
+        loops[slot].pan = clamped
+    }
+
+    /// The selected loop plays its first half, or twice as long.
+    func halve() { resize(doubled: false) }
+    func double() { resize(doubled: true) }
+
+    private func resize(doubled: Bool) {
+        guard let reason = resizeBlocked(doubled: doubled) else {
+            router.send(doubled ? ROUNDS_CMD_DOUBLE : ROUNDS_CMD_HALVE)
+            return
+        }
+        append("Loop \(selectedLoop + 1)", "\(doubled ? "×2" : "½"): \(reason)")
+    }
+
+    /// Why the selected loop can't be halved / doubled now, or nil if it can.
+    func resizeBlocked(doubled: Bool) -> String? {
+        let loop = loops[selectedLoop]
+        if loop.stem >= 0 { return "a song stem's lane" }
+        switch loop.state {
+        case .empty: return "the loop is empty"
+        case .recording, .overdubbing: return "close the \(loop.state == .recording ? "recording" : "overdub") first"
+        case .playing, .stopped: break
+        }
+        if doubled {
+            return loop.seconds * 2 > maxLoopSeconds + 0.001 ? "longer than \(Int(maxLoopSeconds)) s" : nil
+        }
+        return barLength > 0 && loop.bars < 2 ? "a loop is at least a bar" : nil
     }
 
     // MARK: Controls
@@ -548,11 +607,15 @@ final class LooperModel: ObservableObject {
         let previous = knobValues[knob]
         knobValues[knob] = value
         UserDefaults.standard.set(knobValues, forKey: "knobValues")
+        if shiftDown { return panKnobMoved(knob, from: previous, to: value) }
+        // The knob moved for volume, so it no longer sits on the pan.
+        panKnobInControl[knob] = false
         if loops[knob].stem >= 0 {
             stemKnobMoved(knob, stem: loops[knob].stem, from: previous, to: value)
             return
         }
-        switch Self.takeover(gain: loops[knob].gain, inControl: knobInControl[knob], from: previous, to: value) {
+        switch Self.takeover(gain: loops[knob].gain, inControl: knobInControl[knob],
+                             from: previous, to: value) {
         case nil: return
         case let .some((gain, caughtUp)):
             if caughtUp && !knobInControl[knob] {
@@ -568,16 +631,48 @@ final class LooperModel: ObservableObject {
     /// the end of the knob's travel, and from then on follows it exactly.
     /// Returns the new gain and whether the knob now matches; nil to ignore.
     static func takeover(gain: Float, inControl: Bool, from previous: Int, to value: Int) -> (Float, Bool)? {
-        if inControl { return (knobGain(value), true) }
-        let target = Double(sqrt(gain)) * 127   // the volume as a knob position
+        guard let (position, caughtUp) = takeover(position: Double(sqrt(gain)) * 127, inControl: inControl,
+                                                  from: previous, to: value) else { return nil }
+        let fraction = Float(position / 127)
+        return (fraction * fraction, caughtUp)
+    }
+
+    /// The same in knob positions (0...127): the new position for the value.
+    static func takeover(position target: Double, inControl: Bool, from previous: Int, to value: Int) -> (Double, Bool)? {
+        if inControl { return (Double(value), true) }
         let crossed = previous >= 0 && (Double(previous) - target) * (Double(value) - target) <= 0
-        if crossed || abs(Double(value) - target) <= 2 { return (knobGain(value), true) }
+        if crossed || abs(Double(value) - target) <= 2 { return (Double(value), true) }
         guard previous >= 0, value != previous else { return nil }
         let p = Double(previous), v = Double(value)
         let moved = v > p ? target + (v - p) * (127 - target) / max(1, 127 - p)
                           : target - (p - v) * target / max(1, p)
-        let fraction = Float(min(127, max(0, moved)) / 127)
-        return (fraction * fraction, false)
+        return (min(127, max(0, moved)), false)
+    }
+
+    /// Shift + knob: the lane's pan (a loop's, or a song stem's), centre at 64.
+    private func panKnobMoved(_ knob: Int, from previous: Int, to value: Int) {
+        let loop = loops[knob]
+        let current: Float
+        if loop.stem >= 0, let song, loop.stem < song.pans.count {
+            current = song.pans[loop.stem]
+        } else if loop.state != .empty {
+            current = loop.pan
+        } else {
+            return
+        }
+        guard let (position, caughtUp) = Self.takeover(position: Double(current + 1) * 63.5, inControl: panKnobInControl[knob],
+                                                       from: previous, to: value) else { return }
+        if caughtUp && !panKnobInControl[knob] {
+            panKnobInControl[knob] = true
+            append("Launchkey", "Shift + knob \(knob + 1) caught up with loop \(knob + 1)'s pan")
+        }
+        // The knob moved for pan, so it no longer sits on the volume.
+        knobInControl[knob] = false
+        if loop.stem >= 0 { stemKnobInControl[loop.stem] = false }
+        // A little dead zone around the centre so it's easy to find.
+        var pan = Float(position / 63.5 - 1)
+        if abs(pan) < 0.03 { pan = 0 }
+        applyPan(knob, pan)
     }
 
     private var lastLEDState: [String]?
@@ -613,7 +708,7 @@ final class LooperModel: ObservableObject {
     private func updateLaunchkeyLEDs(force: Bool = false) {
         let key = shiftDown
             ? ["parts \(currentPart) \(nextPart)"] + parts.map { "\($0.exists)" }
-            : loops.map { "\($0.state)/\($0.queued)/\(stemLight($0))" }
+            : loops.map { "\($0.state)/\($0.queued)/\(stemLight($0))/\($0.muted)/\(song?.muted ?? [])" }
         guard force || key != lastLEDState || selectedLoop != lastLEDSelected else { return }
         lastLEDState = key
         lastLEDSelected = selectedLoop
@@ -640,9 +735,11 @@ final class LooperModel: ObservableObject {
             let loopState = loop.state
             let color = Self.slotColors[pad]
             if loop.stem >= 0 {
-                // A song stem: its colour while the song plays, dim while
-                // stopped or muted.
-                messages.append(Launchkey.loopPadLED(pad, color: stemLight(loop) == 1 ? color : Launchkey.Color.dimWhite))
+                // A song stem: its colour while the song plays, dim white
+                // while stopped, its colour dimmed while muted.
+                let muted = song.map { loop.stem < $0.muted.count && $0.muted[loop.stem] } ?? false
+                messages.append(Launchkey.loopPadLED(pad, color: muted ? Launchkey.Color.dim(color)
+                                                     : stemLight(loop) == 1 ? color : Launchkey.Color.dimWhite))
                 if pad == selectedLoop {
                     messages.append(Launchkey.loopPadLED(pad, color: Launchkey.Color.white, mode: .flashing))
                 }
@@ -674,7 +771,7 @@ final class LooperModel: ObservableObject {
                 messages.append(Launchkey.loopPadLED(pad, color: color))
                 messages.append(Launchkey.loopPadLED(pad, color: Launchkey.Color.red, mode: .flashing))
             case .playing:
-                messages.append(Launchkey.loopPadLED(pad, color: color))
+                messages.append(Launchkey.loopPadLED(pad, color: loop.muted ? Launchkey.Color.dim(color) : color))
             case .stopped:
                 messages.append(Launchkey.loopPadLED(pad, color: Launchkey.Color.dimWhite))
             }
@@ -750,6 +847,8 @@ final class LooperModel: ObservableObject {
             updated[i].loopID = Int(l.loopID)
             updated[i].shared = l.shared != 0
             updated[i].stem = Int(l.songStem)
+            updated[i].muted = l.muted != 0
+            updated[i].pan = l.pan
             if loops[i].stem >= 0, updated[i].stem < 0, let song, s.songLoaded != 0, !sessionBusy, loops[i].stem < song.stems.count {
                 append("Loop \(i + 1)", "The song's \(song.stems[loops[i].stem]) stem is out (cleared); the lane is free for a loop")
                 knobsLetGo()

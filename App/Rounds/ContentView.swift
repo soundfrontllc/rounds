@@ -166,6 +166,7 @@ struct ContentView: View {
             ProgressView(value: model.state == .recording ? 1 : model.position)
                 .tint(model.state.color)
                 .animation(nil, value: model.position)
+            mixRow
             HStack(spacing: 16) {
                 LevelMeter(label: "In", level: model.inputLevel)
                 LevelMeter(label: "Out", level: model.outputLevel)
@@ -193,6 +194,39 @@ struct ContentView: View {
         }
         .padding(16)
         .background(RoundedRectangle(cornerRadius: 12).fill(Color(nsColor: .controlBackgroundColor)))
+    }
+
+    /// Mute, pan and ½ / ×2 for the selected loop (mute and pan for a stem).
+    private var mixRow: some View {
+        let loop = model.loops[model.selectedLoop]
+        let stem = selectedStem != nil ? loop.stem : -1
+        let muted = stem >= 0 ? model.song?.muted[stem] ?? false : loop.muted
+        let pan = stem >= 0 ? model.song?.pans[safe: stem] ?? 0 : loop.pan
+        return HStack(spacing: 12) {
+            Toggle("Mute", isOn: Binding(get: { muted }, set: { _ in model.toggleMute(model.selectedLoop) }))
+                .disabled(!model.audioRunning || (stem < 0 && loop.state == .empty))
+            Text("Pan").foregroundStyle(.secondary)
+            Text("L").font(.caption).foregroundStyle(.secondary)
+            Slider(value: Binding(get: { Double(pan) }, set: { model.setPan(model.selectedLoop, Float($0)) }), in: -1...1)
+                .frame(width: 140)
+                .disabled(!model.audioRunning || (stem < 0 && loop.state == .empty))
+                .help("Shift + knob \(model.selectedLoop + 1) on the Launchkey")
+            Text("R").font(.caption).foregroundStyle(.secondary)
+            Text(LoopLane.panText(pan)).font(.system(.callout, design: .monospaced)).frame(width: 36, alignment: .leading)
+            Button("C") { model.setPan(model.selectedLoop, 0) }
+                .controlSize(.small)
+                .disabled(pan == 0)
+                .help("Centre")
+            Spacer()
+            if stem < 0 {
+                Button("½") { model.halve() }
+                    .disabled(!model.audioRunning || model.resizeBlocked(doubled: false) != nil)
+                    .help(model.resizeBlocked(doubled: false) ?? "Play the first half (×2 brings the second half back)")
+                Button("×2") { model.double() }
+                    .disabled(!model.audioRunning || model.resizeBlocked(doubled: true) != nil)
+                    .help(model.resizeBlocked(doubled: true) ?? "Twice as long: the loop repeats, ready to overdub a variation")
+            }
+        }
     }
 
     /// The song stem in the selected lane, if any.
@@ -339,21 +373,38 @@ struct LoopLane: View {
             Text(LooperModel.barsText(song.bars))
                 .font(.system(.callout, design: .monospaced))
                 .frame(width: 120, alignment: .leading)
-            HStack(spacing: 6) {
-                Text("♫ \(song.stems[stem]) stem").foregroundStyle(Color.teal).lineLimit(1)
-                Button(muted ? "Unmute" : "Mute") { model.toggleSongMute(stem) }
-                    .controlSize(.small)
-            }
+            Text("♫ \(song.stems[stem]) stem").foregroundStyle(Color.teal).lineLimit(1)
             .font(.callout)
             .frame(width: 200, alignment: .leading)
             StemWaveform(peaks: stem < model.songOverviews.count ? model.songOverviews[stem] : [],
                          position: song.position, color: loop.color, dimmed: muted)
                 .frame(height: 18)
+            muteButton(muted: muted) { model.toggleSongMute(stem) }
+            Text(Self.panText(song.pans[safe: stem] ?? 0))
+                .font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+                .frame(width: 30, alignment: .leading)
             LevelMeter(label: "", level: loop.level).frame(width: 70)
             Slider(value: Binding(get: { Double(song.gains[stem]) }, set: { model.setSongGain(stem, Float($0)) }), in: 0...1)
                 .frame(width: 110)
                 .help("The \(song.stems[stem]) stem's volume (knob \(loop.id + 1) on the Launchkey)")
         }
+    }
+
+    private func muteButton(muted: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text("M").font(.caption.weight(.bold)).frame(width: 18)
+        }
+        .controlSize(.small)
+        .tint(muted ? .yellow : nil)
+        .buttonStyle(.borderedProminent)
+        .opacity(muted ? 1 : 0.45)
+        .help(muted ? "Muted: click to unmute" : "Mute")
+    }
+
+    /// L30 / C / R100.
+    static func panText(_ pan: Float) -> String {
+        let amount = Int((abs(pan) * 100).rounded())
+        return amount == 0 ? "C" : "\(pan < 0 ? "L" : "R")\(amount)"
     }
 
     private func number(filled: Bool) -> some View {
@@ -388,8 +439,13 @@ struct LoopLane: View {
             .font(.callout)
             .frame(width: 200, alignment: .leading)
             ProgressView(value: loop.state == .recording ? 1 : loop.position)
-                .tint(loop.state == .empty ? .secondary : loop.color)
+                .tint(loop.state == .empty ? .secondary : loop.muted ? loop.color.opacity(0.35) : loop.color)
                 .animation(nil, value: loop.position)
+            muteButton(muted: loop.muted) { model.toggleMute(loop.id) }
+                .disabled(loop.state == .empty)
+            Text(loop.state == .empty ? "" : Self.panText(loop.pan))
+                .font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+                .frame(width: 30, alignment: .leading)
             LevelMeter(label: "", level: loop.level).frame(width: 70)
             Slider(value: Binding(get: { Double(loop.gain) }, set: { model.setGain(loop.id, Float($0)) }), in: 0...1)
                 .frame(width: 110)
@@ -797,4 +853,8 @@ struct EventLogView: View {
             }
         }
     }
+}
+
+extension Array {
+    subscript(safe index: Int) -> Element? { indices.contains(index) ? self[index] : nil }
 }

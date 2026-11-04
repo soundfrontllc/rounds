@@ -17,6 +17,7 @@
 #include "footswitch.h"
 
 using rounds::Engine;
+using rounds::Looper;
 
 static int g_failures = 0;
 static int g_checks = 0;
@@ -1438,6 +1439,11 @@ static void testSongLanes() {
     k.run(1024);
     CHECK(k.s(1).songStem == -1 && k.s(2).songStem == 1, "a stem sits in one lane");
     CHECK(std::fabs(k.peak(k.now - 500, k.now) - 0.75f) < 1e-4f, "both stems heard");
+    k.engine.setSongPan(1, 1.0f);
+    k.run(1024);
+    CHECK(std::fabs(k.peak(k.now - 500, k.now) - 0.25f) < 1e-4f, "a stem panned hard right leaves the left side");
+    k.engine.setSongPan(1, 0.0f);
+    k.run(1024);
 
     // Tap and notes on a stem lane don't record.
     k.tap(0, k.now);
@@ -1459,6 +1465,139 @@ static void testSongLanes() {
     k.engine.loadSong(nullptr, 0, 0, 0, 0);
     k.run(256);
     CHECK(k.s(2).songStem == -1, "unloading empties the lanes");
+}
+
+// ---------------------------------------------------------------------------
+// ½ / ×2, mute, pan
+
+static void testHalveDouble() {
+    std::printf("Loops: ½ / ×2 repeat the audio and overdubs; ×2 after ½ brings the second half back; merges keep it\n");
+    Looper::Config cfg;
+    cfg.maxLoopSamples = 40000;
+    cfg.crossfadeSamples = 16;
+    cfg.minLoopSamples = 100;
+    cfg.maxUndoLayers = 1;
+    cfg.flattenSamplesPerBlock = 300;
+    cfg.historySamples = 100;
+    Looper lp(cfg);
+    float input = 0.0f;
+    auto run = [&](int64_t samples, std::function<float(int64_t)> in) {
+        std::vector<float> block(100), out(100);
+        for (int64_t done = 0; done < samples; done += 100) {
+            for (int i = 0; i < 100; i++) block[size_t(i)] = in(lp.clock() + i);
+            std::fill(out.begin(), out.end(), 0.0f);
+            lp.process(block.data(), out.data(), 100, 1.0f);
+        }
+    };
+    (void)input;
+    auto silence = [](int64_t) { return 0.0f; };
+    lp.tap();
+    run(1000, [](int64_t t) { return t < 500 ? 1.0f : 2.0f; });
+    lp.tap();
+    run(1000, silence);
+    CHECK(lp.loopLength() == 1000 && lp.sampleAt(200) == 1.0f && lp.sampleAt(700) == 2.0f, "a 1000-sample loop: 1 then 2");
+
+    CHECK(lp.resize(true, 100) && lp.loopLength() == 2000, "×2: 2000 samples");
+    CHECK(lp.sampleAt(1200) == 1.0f && lp.sampleAt(1700) == 2.0f, "×2 repeats the audio");
+
+    // Overdub 10 across the doubled loop, from its top.
+    run(2000 - lp.heardPosition(), silence);
+    lp.tap();
+    run(2000, [](int64_t) { return 10.0f; });
+    lp.tap();
+    run(1000, silence);
+    CHECK(lp.sampleAt(1200) == 11.0f && lp.sampleAt(1700) == 12.0f, "the overdub covers the doubled loop (%f %f)",
+          lp.sampleAt(1200), lp.sampleAt(1700));
+
+    CHECK(lp.resize(false, 100) && lp.loopLength() == 1000, "½: 1000 samples");
+    CHECK(lp.sampleAt(200) == 11.0f && lp.sampleAt(700) == 12.0f, "½ plays the first half");
+    // What followed index 999 was index 1000 of the doubled loop: the overdub
+    // (10) over the base's own faded-in start (0 there).
+    CHECK(std::fabs(lp.sampleAt(0) - 10.0f) < 1e-4f && std::fabs(lp.sampleAt(15) - 11.0f) < 1.0f,
+          "the new seam crossfades from what followed it (%f)", lp.sampleAt(0));
+
+    // A second overdub (silent) merges the first into the base, which has to
+    // grow to the first overdub's 2000 samples to keep its second half.
+    lp.tap();
+    run(1000, silence);
+    lp.tap();
+    run(4000, silence);
+    CHECK(!lp.merging() && lp.closedLayers() == 1, "the first overdub was merged");
+    CHECK(lp.sampleAt(200) == 11.0f && lp.sampleAt(700) == 12.0f, "merging changed nothing heard");
+    CHECK(lp.resize(true, 100), "×2 again");
+    CHECK(lp.sampleAt(1200) == 11.0f && lp.sampleAt(1700) == 12.0f, "the second half came back after the merge (%f %f)",
+          lp.sampleAt(1200), lp.sampleAt(1700));
+
+    CHECK(!lp.resize(false, 1500), "½ refused below the minimum (a bar)");
+    CHECK(lp.resize(true, 100) && lp.resize(true, 100) && lp.resize(true, 100) && lp.loopLength() == 16000, "×2 up to 16000");
+    CHECK(lp.resize(true, 100) && !lp.resize(true, 100), "×2 refused past the maximum length");
+    lp.tap();
+    CHECK(!lp.resize(false, 100), "refused while overdubbing");
+
+    // MIDI: ×2 repeats the notes, ½ drops the second half.
+    Looper midi(cfg);
+    midi.tap();
+    run(0, silence);
+    midi.notePressed(60, 100, 100);
+    midi.noteReleased(60, 200);
+    midi.notePressed(62, 100, 700);
+    midi.noteReleased(62, 800);
+    std::vector<float> block(100, 0.0f);
+    for (int i = 0; i < 10; i++) midi.process(block.data(), nullptr, 100, 1.0f);
+    midi.tap();
+    CHECK(midi.kind() == Looper::Kind::Midi && midi.noteCount() == 2, "a MIDI loop with 2 notes");
+    CHECK(midi.resize(true, 100) && midi.noteCount() == 4, "×2 repeats the notes");
+    CHECK(midi.resize(false, 100) && midi.resize(false, 100) && midi.noteCount() == 1 && midi.loopLength() == 500,
+          "½ twice keeps the first note");
+}
+
+static void testMuteAndPan() {
+    std::printf("Loops: mute, pan and ½ / ×2 through the engine\n");
+    Engine engine(kRate, 10.0, 128);
+    engine.setLatency(0, 0);
+    std::vector<float> in(128, 0.5f), l(128), r(128);
+    int64_t now = 0;
+    auto run = [&](int64_t samples, float level) {
+        std::fill(in.begin(), in.end(), level);
+        for (int64_t done = 0; done < samples; done += 128) {
+            engine.process(in.data(), l.data(), r.data(), 128);
+            now += 128;
+        }
+    };
+    engine.send(0, ROUNDS_CMD_TAP, -1);
+    run(4 * 48000, 0.5f);            // 4 s: 2 bars at 120 BPM
+    engine.send(0, ROUNDS_CMD_TAP, -1);
+    run(48000, 0.0f);
+    const RoundsLoopStatus s = loopStatus(engine, 0);
+    CHECK(s.state == ROUNDS_LOOP_PLAYING && s.loopLength == 4 * 48000, "a 2-bar loop (%lld)", (long long)s.loopLength);
+    CHECK(std::fabs(l[64] - 0.5f) < 1e-4f && std::fabs(r[64] - 0.5f) < 1e-4f, "centred: both sides");
+
+    engine.setLoopPan(0, -1.0f);
+    run(1280, 0.0f);
+    CHECK(std::fabs(l[64] - 0.5f) < 1e-4f && std::fabs(r[64]) < 1e-6f, "hard left (%f %f)", l[64], r[64]);
+    engine.setLoopPan(0, 0.5f);
+    run(1280, 0.0f);
+    CHECK(std::fabs(l[64] - 0.25f) < 1e-4f && std::fabs(r[64] - 0.5f) < 1e-4f, "half right (%f %f)", l[64], r[64]);
+    CHECK(std::fabs(loopStatus(engine, 0).pan - 0.5f) < 1e-6f, "pan reported");
+
+    engine.setLoopMute(0, 1);
+    run(1280, 0.0f);
+    CHECK(l[64] == 0.0f && r[64] == 0.0f && loopStatus(engine, 0).muted == 1, "muted");
+    engine.setLoopMute(0, 0);
+    run(1280, 0.0f);
+    CHECK(std::fabs(r[64] - 0.5f) < 1e-4f, "unmuted");
+
+    engine.send(0, ROUNDS_CMD_HALVE, -1);
+    run(1280, 0.0f);
+    CHECK(loopStatus(engine, 0).loopLength == 2 * 48000, "½: 1 bar");
+    engine.send(0, ROUNDS_CMD_HALVE, -1);
+    run(1280, 0.0f);
+    CHECK(loopStatus(engine, 0).loopLength == 2 * 48000, "½ refused below a bar");
+    engine.send(0, ROUNDS_CMD_DOUBLE, -1);
+    engine.send(0, ROUNDS_CMD_DOUBLE, -1);
+    run(1280, 0.0f);
+    CHECK(loopStatus(engine, 0).loopLength == 8 * 48000, "×2 twice: 4 bars");
+    CHECK(status(engine).bars == 2 && status(engine).barLength == 2 * 48000, "the tempo stays");
 }
 
 int main() {
@@ -1495,6 +1634,8 @@ int main() {
     testSessionParts();
     testSongTiming();
     testSongLanes();
+    testHalveDouble();
+    testMuteAndPan();
     std::printf("\n%d checks, %d failed\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

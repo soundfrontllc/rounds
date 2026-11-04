@@ -57,6 +57,12 @@ typedef enum {
     // Play button (send to loop -1): stop every loop, or start every stopped
     // loop together from the top of the longest.
     ROUNDS_CMD_START_STOP_ALL = 6,
+    // ½ / ×2: the loop plays its first half, or twice as long (its audio and
+    // overdubs repeat; ×2 after ½ brings the second half back). Only while
+    // the loop plays or is stopped; ½ keeps at least a bar, ×2 fits the
+    // maximum loop length.
+    ROUNDS_CMD_HALVE = 7,
+    ROUNDS_CMD_DOUBLE = 8,
 } RoundsCommand;
 
 typedef enum {
@@ -131,6 +137,8 @@ typedef struct {
     int32_t loopID;         // the engine loop this slot plays
     int32_t shared;         // 1: "New part" keeps this loop instead of copying it
     int32_t songStem;       // the song stem in this lane (peak is then the stem's), or -1
+    int32_t muted;
+    float pan;              // -1 left ... 0 centre ... 1 right
 } RoundsLoopStatus;
 
 typedef struct {
@@ -194,6 +202,10 @@ void rounds_engine_set_latency(RoundsEngine* engine, int32_t inputLatency, int32
 void rounds_engine_set_monitor_gain(RoundsEngine* engine, float gain);
 // Volume of a loop ID (it goes with the loop into every part that shares it).
 void rounds_engine_set_loop_gain(RoundsEngine* engine, int32_t loopID, float gain);
+// Mute and pan of a loop ID (they go with it like its volume). Pan -1 is hard
+// left, 1 hard right; at 0 both sides get the loop at full level.
+void rounds_engine_set_loop_mute(RoundsEngine* engine, int32_t loopID, int32_t muted);
+void rounds_engine_set_loop_pan(RoundsEngine* engine, int32_t loopID, float pan);
 // Quantize record/play/stop to the next bar (off by default in the engine).
 void rounds_engine_set_quantize(RoundsEngine* engine, int32_t on);
 // Click on every beat while anything plays (0 = off, the default).
@@ -247,6 +259,8 @@ int32_t rounds_engine_load_song(RoundsEngine* engine, const float* const* stems,
                                 int64_t barLength, int64_t downbeat);
 void rounds_engine_unload_song(RoundsEngine* engine);
 void rounds_engine_set_song_gain(RoundsEngine* engine, int32_t stem, float gain);
+// Pan of a stem, like rounds_engine_set_loop_pan.
+void rounds_engine_set_song_pan(RoundsEngine* engine, int32_t stem, float pan);
 // Where Play starts the song (bar from 1); while it plays, it jumps there at the next bar line.
 void rounds_engine_set_song_bar(RoundsEngine* engine, int32_t bar);
 // Puts song stem `stem` in lane `slot` (in every part), or empties the lane

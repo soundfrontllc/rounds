@@ -57,6 +57,12 @@ void rounds_engine_set_loop_gain(RoundsEngine* engine, int32_t loop, float gain)
     engine->engine.setLoopGain(loop, gain);
 }
 
+void rounds_engine_set_loop_mute(RoundsEngine* engine, int32_t loop, int32_t muted) {
+    engine->engine.setLoopMute(loop, muted != 0);
+}
+
+void rounds_engine_set_loop_pan(RoundsEngine* engine, int32_t loop, float pan) { engine->engine.setLoopPan(loop, pan); }
+
 void rounds_engine_set_quantize(RoundsEngine* engine, int32_t on) { engine->engine.setQuantize(on != 0); }
 
 void rounds_engine_set_click_gain(RoundsEngine* engine, float gain) { engine->engine.setClickGain(gain); }
@@ -85,6 +91,8 @@ void rounds_engine_unload_song(RoundsEngine* engine) { engine->engine.loadSong(n
 void rounds_engine_set_song_gain(RoundsEngine* engine, int32_t stem, float gain) {
     engine->engine.setSongGain(stem, gain);
 }
+
+void rounds_engine_set_song_pan(RoundsEngine* engine, int32_t stem, float pan) { engine->engine.setSongPan(stem, pan); }
 
 void rounds_engine_set_song_bar(RoundsEngine* engine, int32_t bar) { engine->engine.setSongBar(bar); }
 

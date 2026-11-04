@@ -23,6 +23,7 @@ struct LayerPool {
         int64_t openIndex = 0;    // loop index of its first sample
         int64_t written = 0;      // samples written so far
         bool writing = true;      // false once the punch-out tail is done
+        int64_t period = 0;       // loop length when it was opened: it repeats every `period`
     };
     LayerPool(int layers, int64_t samples);
     int freeCount() const;
@@ -89,6 +90,11 @@ public:
     void stop();
     void stopRevertingTap();   // hold: revert the last tap's effect, then stop
     void clear();
+    // ½ / ×2: the loop plays its first half, or twice as long (its audio and
+    // overdubs repeat; nothing is copied, so ×2 after ½ brings the second half
+    // back). Only while playing or stopped. False if the length isn't allowed:
+    // ½ needs at least `minimum` samples left, ×2 room for twice the length.
+    bool resize(bool doubled, int64_t minimum);
 
     // Adds the loop's playback (times `gain`) into `out`, and records `in`.
     // out == nullptr: the loop is in a part that isn't playing; it only keeps time.
@@ -179,6 +185,7 @@ private:
     void finishPendingWrites();
     void writeInput(float sample, int64_t s);
     float readLoop(int64_t index) const;
+    float readRaw(int64_t index) const;
     bool layerCovers(const Layer& layer, int64_t index) const;
     void stepFlatten();
     int freeSlot() const;
@@ -198,6 +205,7 @@ private:
     int64_t baseWritten_ = 0;
     bool baseWriting_ = false;
     int64_t loopLength_ = 0;
+    int64_t basePeriod_ = 0;  // the base repeats every basePeriod_ samples (½ / ×2 leave it)
     int64_t origin_ = 0;      // real time at which loop index 0 is heard (mod length)
     int64_t barLength_ = 0;
     std::vector<float> history_;  // input by real time, modulo its size
@@ -209,6 +217,7 @@ private:
 
     int flattenSlot_ = -1;    // oldest layer being merged into the base
     int64_t flattenPos_ = 0;
+    int64_t flattenExtend_ = -1;  // >= 0: first repeating the base out to the layer's period
 
     Kind kind_ = Kind::Audio;
     std::vector<Note> notes_;

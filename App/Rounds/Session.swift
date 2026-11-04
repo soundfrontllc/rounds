@@ -15,6 +15,8 @@ struct SessionManifest: Codable {
         var slot: Int          // loop ID
         var gain: Float
         var shared: Bool?
+        var muted: Bool?
+        var pan: Float?
         var file: String?      // audio loops
         var samples: Int64?    // loop length at `sampleRate`
         var instrument: String?   // MIDI loops: instrument name
@@ -41,6 +43,7 @@ struct SessionManifest: Codable {
         var gains: [Float]
         var muted: [Bool]
         var lanes: [Int]?      // the lane each stem plays in (-1 none); nil: stem i in lane i
+        var pans: [Float]?
     }
 
     struct Part: Codable {
@@ -274,7 +277,8 @@ extension LooperModel {
             var loop = RoundsLoopStatus()
             rounds_engine_get_pool_loop_status(engine, Int32(id), &loop)
             let name = loopName(id)
-            var entry = SessionManifest.Loop(slot: id, gain: loop.gain, shared: loop.shared != 0 ? true : nil)
+            var entry = SessionManifest.Loop(slot: id, gain: loop.gain, shared: loop.shared != 0 ? true : nil,
+                                             muted: loop.muted != 0 ? true : nil, pan: loop.pan != 0 ? loop.pan : nil)
             defer { manifest.loops.append(entry) }
             switch LoopState(rawValue: loop.state) ?? .empty {
             case .empty: continue
@@ -322,7 +326,8 @@ extension LooperModel {
         if let song, let source = songSource {
             manifest.song = SessionManifest.Song(name: song.name, files: song.stems.map { "song-\($0.lowercased()).caf" },
                                                  bpm: source.grid.bpm, downbeat: source.grid.downbeat,
-                                                 gains: song.gains, muted: song.muted, lanes: songLanes)
+                                                 gains: song.gains, muted: song.muted, lanes: songLanes,
+                                                 pans: song.pans)
             songStems = source.stems
         }
         let toWrite = manifest
@@ -385,6 +390,7 @@ extension LooperModel {
                 // Loaded before any loop, so it sets the tempo again.
                 await loadSong(name: entry.name, stems: stems, grid: grid, gains: entry.gains, muted: entry.muted,
                                lanes: entry.lanes ?? Array(stems.indices), fitTo: nil)
+                if let pans = entry.pans { for (stem, pan) in pans.enumerated() { setSongPan(stem, pan) } }
             } catch {
                 append("Session", "The song couldn't be loaded: \(error.localizedDescription)")
             }
@@ -425,6 +431,8 @@ extension LooperModel {
         for loop in manifest.loops where Self.validLoopID(loop.slot) {
             rounds_engine_set_loop_gain(engine, Int32(loop.slot), loop.gain)
             if loop.shared == true { rounds_engine_set_shared(engine, Int32(loop.slot), 1) }
+            if loop.muted == true { rounds_engine_set_loop_mute(engine, Int32(loop.slot), 1) }
+            if let pan = loop.pan { rounds_engine_set_loop_pan(engine, Int32(loop.slot), pan) }
         }
         knobsLetGo()
         if let part = manifest.part, part > 0, part < Int(ROUNDS_MAX_PARTS) { rounds_engine_switch_part(engine, Int32(part)) }
